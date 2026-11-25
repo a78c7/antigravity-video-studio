@@ -17,6 +17,60 @@
 
 ---
 
+## 界面实拍预览（WebUI）
+
+> 以下 4 张均为内置中立示范剧目（`示例剧目：3D 虚拟搭档微短剧`）在 `1440×900` 桌面端下的纯本地实拍界面：
+
+| 主制片工作台与分镜/操作总览 | 跨集资产圣经与永久防穿帮护盾 |
+| :---: | :---: |
+| ![主制片工作台与分镜总览](docs/screenshots/01_workspace_overview.png) | ![跨集资产圣经与防穿帮护盾](docs/screenshots/02_assets_guard.png) |
+| **6 步流水线 × 预算器 × 一镜一清闭环**：统筹剧本、首尾帧、Flow 显式指令头与 SDK/CLI 1K/2K 直出 | **跨集不吃书、跨镜不变脸**：固定 `@Tag`、英文不变锁词、永久防穿帮护盾 `negative_guard_en` 与一键棚拍洗图 |
+
+| 系统设置 · 5 档订阅预设与三油箱监控 | 音画幻觉体检与三轨配音工作台 |
+| :---: | :---: |
+| ![系统设置与三油箱监控](docs/screenshots/03_subscription_quota.png) | ![音画质检与三轨配音界面](docs/screenshots/04_topics_or_delivery.png) |
+| **环境红绿灯 × 5 档 Google 订阅一键校准**：自动校准 API 月赠金、Flow 积分池、Colab GPU 与 SDK/CLI 双通道 | **3 帧 + 音轨幻觉体检 × 三轨旁白混音**：提前排雷黑屏/静音/AI 乱说话，支持批量中文 TTS、真人干声上传与 VO 对齐 |
+
+<!-- 实测演示成片占位提示（后续手动上传，当前不留空死链）：
+如需在 README 展示 15–25 秒实测演示成片（MP4），可在 GitHub Issue / PR 编辑框拖拽上传 MP4 获取官方托管视频链接，随后取消下方注释并替换为真实链接：
+
+### 实测演示成片（15–25 秒完整闭环实拍）
+
+https://github.com/user-attachments/assets/<replace-with-uploaded-demo-video-id>
+-->
+
+---
+
+## 三口福利油箱 × 8 阶段导演门禁流程图
+
+```mermaid
+flowchart LR
+    subgraph TANKS["三口独立福利油箱（按 5 档订阅一键校准）"]
+        T1["油箱 1：Gemini API / 月度赠金<br/>(默认 google-genai SDK 直连 · 可选 CLI)"]
+        T2["油箱 2：Google Flow 月积分<br/>(手动发车包 · 仅导免费 1080p)"]
+        T3["油箱 3：Google Colab GPU<br/>(L4 省 CU 跑 4K HLG HDR)"]
+    end
+
+    subgraph PIPE["8 阶段 AI 短剧导演流水线（4 处强制拍板门禁）"]
+        S1["1. 选题雷达 & 立项<br/>(≥60s 结构规划)"] --> S2["2. 资产圣经 & 永久护盾<br/>(短名 + negative_guard_en)"]
+        S2 --> S3["3. 双轮主编剧本 & 拆镜<br/>(前3秒钩子 + 原创 BGM)"]
+        S3 --> G1{"4. 首尾帧生图<br/>[门禁 1：弹窗定图]"}
+        G1 --> G2{"5. 试卡体检 & 视频定稿<br/>[门禁 2/3：选引擎 + 放行]"}
+        G2 --> G3{"6. 三轨声音架构<br/>[门禁 4：选 VO 旁白]"}
+        G3 --> S7["7. 音画对齐母带渲染<br/>(本机 1080p / Colab 4K HLG)"]
+        S7 --> S8["8. 双比例封面 & 交付<br/>(文案 + AI 原创证明 + 清废片)"]
+    end
+
+    T1 -. "策划 / 生图 / 视频 / BGM / TTS" .-> S3
+    T1 -. "SDK 直连 / 可选 CLI" .-> G1
+    T1 -. "360p 试卡 → 1080p" .-> G2
+    T2 -. "手动发车包 (0 封号)" .-> G2
+    T1 -. "批量中文 TTS" .-> G3
+    T3 -. "4K/30fps HLG HDR" .-> S7
+```
+
+---
+
 ## v1.0.1 核心亮点
 
 - **官方 `google-genai` Python SDK 直连主通道**：无需额外折腾第三方命令行，在网页「系统设置」填入 `GEMINI_API_KEY` 即可开箱一键出图、出视频、生成原创配乐与中文 TTS 旁白；原 `gemini-api` CLI 作为可选/自动回退通道完整保留（支持 `MEDIA_ENGINE_MODE` 在 `auto` / `sdk` / `cli` 间自由切换）。
@@ -37,36 +91,6 @@
 - **剪映手搓太耗命**：每次都要手拉三轨（原生环境音 + 旁白 + BGM）、手动对齐超长旁白、手调人声压低配乐、手调竖屏字幕安全区防底栏遮挡。
 
 **反重力视频工坊**用一个轻量单进程本地 Web 制片台（FastAPI + SQLite WAL）搭配 **Antigravity 专属导演 Skill（`skills/agvs-director`）** 解决整条链路：**AI 干脏活累活（搜选题、写分镜、并发抽卡、看图排雷、听音查幻觉、混音压字幕），所有审美与花钱节点弹出选择题交给你拍板。**
-
----
-
-## 三口福利油箱 × 8 阶段导演门禁流程图
-
-```mermaid
-flowchart LR
-    subgraph TANKS["三口独立福利油箱（按订阅档位一键校准）"]
-        T1["油箱 1：Gemini API / 月度赠金<br/>(默认 google-genai SDK 直连 · 可选 CLI)"]
-        T2["油箱 2：Google Flow 月积分<br/>(手动发车包 · 仅导免费 1080p)"]
-        T3["油箱 3：Google Colab GPU<br/>(L4 省 CU 跑 4K HLG HDR)"]
-    end
-
-    subgraph PIPE["8 阶段 AI 短剧导演流水线（4 处强制拍板门禁）"]
-        S1["1. 选题雷达 & 立项<br/>(≥60s 结构规划)"] --> S2["2. 资产圣经 & 永久护盾<br/>(短名 + negative_guard_en)"]
-        S2 --> S3["3. 双轮主编剧本 & 拆镜<br/>(前3秒钩子 + 原创 BGM)"]
-        S3 --> G1{"4. 首尾帧生图<br/>[门禁 1 弹窗定图]"}
-        G1 --> G2{"5. 视频生成<br/>[选引擎 + 门禁 2 体检]"}
-        G2 --> G3{"6. 三轨声音架构<br/>[门禁 4 选 VO 旁白]"}
-        G3 --> S7["7. 音画对齐渲染<br/>(本机 1080p / Colab 4K HLG)"]
-        S7 --> S8["8. 双比例封面 & 交付<br/>(文案 + AI 原创证明 + 清废片)"]
-    end
-
-    T1 -. "策划 / 生图 / 视频 / BGM / TTS" .-> S3
-    T1 -. "SDK 直连 / 可选 CLI" .-> G1
-    T1 -. "360p 试卡 → 1080p" .-> G2
-    T2 -. "手动发车包 (0 封号)" .-> G2
-    T1 -. "TTS 旁白" .-> G3
-    T3 -. "4K/30fps HLG HDR" .-> S7
-```
 
 ---
 
@@ -219,6 +243,8 @@ chmod +x start.sh
 antigravity-video-studio/
 ├── backend/                 # FastAPI 后端、SQLite 数据层、SDK/CLI 媒体引擎、异步任务中心与预构建静态页
 ├── frontend/                # React + TypeScript + Vite 前端源码
+├── docs/
+│   └── screenshots/         # WebUI 实拍展示截图（1440×900 高清 PNG）
 ├── skills/
 │   └── agvs-director/       # Antigravity 专属开箱向导 + 8 阶段 AI 短剧导演 Skill
 ├── tests/
