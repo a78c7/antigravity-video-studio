@@ -6,6 +6,8 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows%20%7C%20Linux-64748b.svg)](#快速上手-b纯命令行手动启动macos--linux--windows)
 [![CI](https://github.com/a78c7/antigravity-video-studio/actions/workflows/ci.yml/badge.svg)](https://github.com/a78c7/antigravity-video-studio/actions/workflows/ci.yml)
 
+**语言 / Language**：**简体中文** | [English](README.en.md)
+
 > **社区非官方声明**：本项目为非官方社区开源工具，与 Google / Antigravity 官方无任何隶属关系。
 >
 > **专为 Google Gemini / Antigravity（反重力）订阅用户打造的本地 AI 短剧全流程制片台。**
@@ -258,6 +260,7 @@ antigravity-video-studio/
 ├── start.ps1 / start.bat    # Windows 一键启动脚本（UTF-8 加固）
 ├── pyproject.toml           # Python 项目与精简依赖声明
 ├── .env.example             # 脱敏配置模板
+├── README.md / README.en.md # 中英双语说明文档
 └── LICENSE                  # GNU AGPL-3.0 协议全文
 ```
 
