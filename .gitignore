@@ -1,0 +1,38 @@
+# 密钥、本机配置与本地隐私黑名单严禁入库
+.env
+.env.local
+.env.*.local
+.secrets.env
+.privacy-blocklist.local
+
+# 本机运行时数据、数据库与日志
+data/
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.log
+
+# Python 虚拟环境与缓存
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# 前端依赖与临时构建目录（backend/static/ 为预构建产物，保留入库以便开箱即用）
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# 系统与编辑器杂项
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

@@ -1,0 +1,58 @@
+# ============================================================
+# 反重力视频工坊（Antigravity Video Studio）
+# 通用 Nginx HTTPS 反向代理参考模板（自托管协作端）
+#
+# 使用前请将 studio.example.com 及证书路径替换为你自己的域名和证书。
+# ============================================================
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name studio.example.com;
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name studio.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/studio.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/studio.example.com/privkey.pem;
+
+    # 允许本地制片台同步成片/预览视频，支持视频流式拖动（Range）
+    client_max_body_size 300m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8766;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_connect_timeout 5s;
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+    }
+
+    # 可选：若你在同机自建了开源 ntfy 推送服务，可取消下方注释（需在 http 块定义 $connection_upgrade）
+    # location = /ntfy {
+    #     return 301 /ntfy/;
+    # }
+    # location ^~ /ntfy/ {
+    #     client_max_body_size 10m;
+    #     proxy_pass http://127.0.0.1:2586/;
+    #     proxy_http_version 1.1;
+    #     proxy_set_header Host $http_host;
+    #     proxy_set_header X-Real-IP $remote_addr;
+    #     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    #     proxy_set_header X-Forwarded-Proto $scheme;
+    #     proxy_set_header Upgrade $http_upgrade;
+    #     proxy_set_header Connection $connection_upgrade;
+    #     proxy_buffering off;
+    #     proxy_read_timeout 3600s;
+    #     proxy_send_timeout 3600s;
+    # }
+}
