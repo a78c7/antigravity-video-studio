@@ -117,7 +117,7 @@ _agvs_port = (os.environ.get("AGVS_PORT") or "8765").strip() or "8765"
 
 app = FastAPI(
     title=f"{DEFAULT_BRAND_NAME} · AI 短剧全流程制片台",
-    version="2.0.0",
+    version="1.0.0",
     lifespan=lifespan,
     docs_url=None if _cloud_mode_at_boot else "/docs",
     redoc_url=None if _cloud_mode_at_boot else "/redoc",

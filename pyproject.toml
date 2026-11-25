@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "antigravity-video-studio"
-version = "0.1.0"
+version = "1.0.0"
 description = "反重力视频工坊 — 面向 Google Gemini / Antigravity 订阅用户的本地 AI 短剧全流程制片台"
 readme = "README.md"
 license = "AGPL-3.0-or-later"
