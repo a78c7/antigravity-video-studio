@@ -10,7 +10,9 @@
 
 from __future__ import annotations
 
+import inspect
 import json
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,7 @@ from ..cli_media import cli_generate_covers, cli_generate_tts
 from ..config import DATA_DIR, MEDIA_DIR, load_config
 from ..db import db_ctx, now_str, rows_to_dicts
 from ..flow_compiler import AUDIO_STRATEGIES, FLOW_MODES, compile_shot_prompts
+from ..jobs import JobCancelledError, JobContext, cancel_job, get_job, list_jobs, submit_job
 from ..media_ops import (
     build_master_base_mp4,
     export_fcpxml,
@@ -41,23 +44,113 @@ def _brand_name() -> str:
     return (load_config().get("BRAND_NAME") or "反重力视频工坊").strip() or "反重力视频工坊"
 
 
+def _filter_supported_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """仅透传目标函数签名支持的可选关键字参数（兼顾回调扩展与测试桩/旧签名）"""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
+def _make_job_progress_cb(ctx: JobContext) -> Any:
+    """将底层媒体/渲染/Colab 回调统一适配到 JobContext.update"""
+
+    def _cb(*args: Any, **kwargs: Any) -> None:
+        pct = kwargs.get("progress_pct", kwargs.get("pct"))
+        msg = kwargs.get("stage_msg", kwargs.get("msg", kwargs.get("message")))
+        log_line = kwargs.get("log_line")
+        provider_task_id = kwargs.get("provider_task_id")
+        if len(args) >= 2:
+            if isinstance(args[0], (int, float)):
+                pct = int(args[0])
+                msg = str(args[1])
+            else:
+                msg = str(args[0])
+                if isinstance(args[1], (int, float)):
+                    pct = int(args[1])
+        elif len(args) == 1:
+            if isinstance(args[0], (int, float)):
+                pct = int(args[0])
+            elif isinstance(args[0], str):
+                msg = args[0]
+        ctx.update(
+            progress_pct=int(pct) if pct is not None else None,
+            stage_msg=str(msg) if msg is not None else None,
+            log_line=str(log_line) if log_line is not None else None,
+            provider_task_id=str(provider_task_id) if provider_task_id is not None else None,
+        )
+
+    return _cb
+
+
+def _normalize_vo_sync_mode(raw: str | None) -> str:
+    mode = (raw or "pad").strip().lower()
+    if mode not in ("pad", "speed"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"不支持的 vo_sync_mode：{mode}，可选：pad（尾帧定格对齐）或 speed（微加速对齐）",
+        )
+    return mode
+
+
+# ==================== 轻量异步任务中心 API（SQLite + 线程池 + 2s 轮询） ====================
+
+
+@router.get("/jobs")
+def list_async_jobs(
+    episode_id: int | None = None,
+    status: str | None = None,
+    limit: int = 30,
+) -> dict[str, Any]:
+    """查询异步任务队列（支持按 episode_id / status 过滤，供前端 2 秒轮询）"""
+    safe_limit = max(1, min(100, int(limit or 30)))
+    items = list_jobs(episode_id=episode_id, status=status, limit=safe_limit)
+    return {"items": items, "jobs": items}
+
+
+@router.get("/jobs/{job_id}")
+def get_async_job(job_id: int) -> dict[str, Any]:
+    """查询单个异步任务详情（含 progress_pct / stage_msg / status / log_text / result / output_path / error_msg / cancel_requested）"""
+    job = get_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="异步任务不存在")
+    return {**job, "job": job}
+
+
+@router.post("/jobs/{job_id}/cancel")
+def cancel_async_job(job_id: int) -> dict[str, Any]:
+    """标记取消指定异步任务并返回最新状态"""
+    job = cancel_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="异步任务不存在")
+    return {"ok": True, **job, "job": job}
+
+
 class DispatchColabRequest(BaseModel):
     gpu_tier: str = "L4"
     task_mode: str = "upscale_4k_30fps"  # 'upscale_4k_30fps' | 'upscale_4k_60fps' | 'ai_60fps_1080p' | 'probe_gpu'
     hdr_hlg: bool = True
     burn_subtitles: bool = True
+    vo_sync_mode: str = "pad"  # 'pad' | 'speed'
+    async_mode: bool = False
 
 
 class RenderLocalRequest(BaseModel):
     hdr_hlg: bool = False
     burn_subtitles: bool = False
     bgm_volume: float | None = None
+    vo_sync_mode: str = "pad"  # 'pad' | 'speed'
+    async_mode: bool = False
 
 
 class CliGenerateTtsRequest(BaseModel):
     voice: str = "Kore"
     style_prompt: str = ""
     shot_ids: list[int] | None = None
+    async_mode: bool = False
 
 
 class QcInspectVideosRequest(BaseModel):
@@ -73,6 +166,7 @@ class CliGenerateCoversRequest(BaseModel):
     highlight_shot_ids: list[int] | None = None
     count_per_ratio: int = 2
     image_size: str = "2K"
+    async_mode: bool = False
 
 
 class SelectCoverRequest(BaseModel):
@@ -365,6 +459,7 @@ def export_episode_ai_proof(episode_id: int) -> dict[str, Any]:
     )
 
     proof_path.write_text("\n".join(lines), encoding="utf-8")
+    proof_abs = str(proof_path.resolve())
 
     with db_ctx() as conn:
         conn.execute(
@@ -374,14 +469,19 @@ def export_episode_ai_proof(episode_id: int) -> dict[str, Any]:
             """,
             (
                 episode_id,
-                str(proof_path.resolve()),
+                proof_abs,
                 f"已导出 AI 原创制作证明（共 {len(assets)} 项资产、{len(shots)} 个分镜 Prompt 档案，可用于平台原创合规存证）",
                 ts,
                 ts,
             ),
         )
+        conn.execute(
+            "UPDATE episodes SET ai_proof_path = ?, updated_at = ? WHERE id = ?",
+            (proof_abs, ts, episode_id),
+        )
     return {
-        "proof_path": str(proof_path.resolve()),
+        "proof_path": proof_abs,
+        "ai_proof_path": proof_abs,
         "bundle_dir": str(bundle.resolve()),
         "shot_count": len(shots),
         "asset_count": len(assets),
@@ -461,18 +561,24 @@ def export_episode_colab_pack(episode_id: int) -> dict[str, Any]:
 
 
 @router.post("/episodes/{episode_id}/dispatch-colab")
-def dispatch_episode_colab(episode_id: int, body: DispatchColabRequest | None = None) -> dict[str, Any]:
+def dispatch_episode_colab(
+    episode_id: int,
+    body: DispatchColabRequest | None = None,
+    async_mode: bool = False,
+) -> dict[str, Any]:
     """
     通过 Google Colab 官方 API & 官方 CLI（google-colab-cli）直接派发云端 GPU 任务：
     - upscale_4k_30fps（默认）：上传真 1080p 三轨音频基准片，云端 GPU 跑 Real-ESRGAN v3 4K 超分 + 10-bit HLG HDR + 黄金安全区字幕（保源帧率电影感）；
     - upscale_4k_60fps：云端 GPU 跑 RIFE v4.26 60fps + Real-ESRGAN v3 4K 超分 + HLG HDR；
     - ai_60fps_1080p：云端 GPU 仅跑真 AI RIFE v4.26 60fps 极速补帧（保持 1080p，省 CU 极速交付）；
-    - probe_gpu：租用指定 GPU（默认 L4 防排队）跑 15 秒冒烟实测并自动销毁 VM。
+    - probe_gpu：租用指定 GPU（默认 L4 防排队）跑 15 秒冒烟实测并自动销毁 VM；
+    - 支持 async_mode=True 走轻量异步任务队列，实时汇报进度与支持取消。
     """
     req = body or DispatchColabRequest()
     valid_modes = ("upscale_4k_30fps", "upscale_4k_60fps", "ai_60fps_1080p", "probe_gpu")
     if req.task_mode not in valid_modes:
         raise HTTPException(status_code=400, detail=f"不支持的 task_mode: {req.task_mode}，可选：{', '.join(valid_modes)}")
+    vo_sync_mode = _normalize_vo_sync_mode(req.vo_sync_mode)
 
     with db_ctx() as conn:
         proj, ep, items, _ = _collect_timeline(conn, episode_id)
@@ -480,8 +586,6 @@ def dispatch_episode_colab(episode_id: int, body: DispatchColabRequest | None = 
         raise HTTPException(status_code=400, detail="当前没有已定稿的分镜视频，无法派发至 Colab 云端增强。")
 
     bundle = make_export_bundle_dir(proj["slug"], ep["ep_number"])
-    srt_path = export_srt(items, bundle / f"E{ep['ep_number']:02d}_colab.srt") if items else bundle / "empty.srt"
-    ts = now_str()
     job_type_map = {
         "probe_gpu": "colab_gpu_probe",
         "upscale_4k_30fps": "colab_ai_4k30",
@@ -489,6 +593,65 @@ def dispatch_episode_colab(episode_id: int, body: DispatchColabRequest | None = 
         "ai_60fps_1080p": "colab_ai_1080p60",
     }
     job_type = job_type_map.get(req.task_mode, "colab_ai_4k30")
+
+    def _run_colab(ctx: JobContext | None = None, sync_job_id: int | None = None) -> dict[str, Any]:
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(
+                progress_pct=5,
+                stage_msg=f"正在准备 Colab {req.gpu_tier} 云端任务（{req.task_mode}）...",
+            )
+        srt_kwargs = _filter_supported_kwargs(export_srt, {"vo_sync_mode": vo_sync_mode})
+        srt_path = export_srt(items, bundle / f"E{ep['ep_number']:02d}_colab.srt", **srt_kwargs) if items else bundle / "empty.srt"
+        colab_extra: dict[str, Any] = {"vo_sync_mode": vo_sync_mode}
+        if ctx is not None:
+            colab_extra["progress_cb"] = _make_job_progress_cb(ctx)
+            colab_extra["cancel_check"] = ctx.is_cancelled
+        res = dispatch_episode_to_colab(
+            proj,
+            ep,
+            items,
+            srt_path,
+            gpu_tier=req.gpu_tier,
+            task_mode=req.task_mode,
+            burn_subtitles=req.burn_subtitles,
+            hdr_hlg=req.hdr_hlg,
+            **_filter_supported_kwargs(dispatch_episode_to_colab, colab_extra),
+        )
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(
+                progress_pct=96,
+                stage_msg="Colab 云端任务完成，正在归档母带记录...",
+                log_line=res.get("log") or None,
+            )
+
+        ts2 = now_str()
+        with db_ctx() as conn:
+            if ctx is None and sync_job_id is not None:
+                conn.execute(
+                    "UPDATE render_jobs SET target_host = ?, status = 'done', output_path = ?, log_text = ?, updated_at = ? WHERE id = ?",
+                    (f"colab ({res['gpu_tier']})", res.get("output_path", ""), res["log"], ts2, sync_job_id),
+                )
+            if res.get("output_path"):
+                conn.execute(
+                    "UPDATE episodes SET latest_output_path = ?, status = 'mastered', updated_at = ? WHERE id = ?",
+                    (res["output_path"], ts2, episode_id),
+                )
+        return res
+
+    use_async = bool(req.async_mode or async_mode)
+    if use_async:
+        job = submit_job(
+            job_type,
+            lambda ctx: _run_colab(ctx, None),
+            episode_id=episode_id,
+            target_host=f"colab:{req.gpu_tier}",
+            stage_msg=f"已排队：等待派发 Colab {req.gpu_tier}（{req.task_mode}）",
+        )
+        return {"ok": True, "async": True, "job_id": job["id"], "job": job}
+
+    ts = now_str()
     with db_ctx() as conn:
         cur = conn.execute(
             """
@@ -507,16 +670,7 @@ def dispatch_episode_colab(episode_id: int, body: DispatchColabRequest | None = 
         job_db_id = cur.lastrowid
 
     try:
-        res = dispatch_episode_to_colab(
-            proj,
-            ep,
-            items,
-            srt_path,
-            gpu_tier=req.gpu_tier,
-            task_mode=req.task_mode,
-            burn_subtitles=req.burn_subtitles,
-            hdr_hlg=req.hdr_hlg,
-        )
+        return _run_colab(None, job_db_id)
     except Exception as exc:
         with db_ctx() as conn:
             conn.execute(
@@ -525,31 +679,21 @@ def dispatch_episode_colab(episode_id: int, body: DispatchColabRequest | None = 
             )
         raise HTTPException(status_code=503, detail=str(exc))
 
-    ts2 = now_str()
-    with db_ctx() as conn:
-        conn.execute(
-            "UPDATE render_jobs SET target_host = ?, status = 'done', output_path = ?, log_text = ?, updated_at = ? WHERE id = ?",
-            (f"colab ({res['gpu_tier']})", res.get("output_path", ""), res["log"], ts2, job_db_id),
-        )
-        if res.get("output_path"):
-            conn.execute(
-                "UPDATE episodes SET latest_output_path = ?, status = 'mastered', updated_at = ? WHERE id = ?",
-                (res["output_path"], ts2, episode_id),
-            )
-    return res
-
 
 @router.post("/episodes/{episode_id}/render-local")
 def render_episode_local_preview(
     episode_id: int,
     body: RenderLocalRequest | None = None,
+    async_mode: bool = False,
 ) -> dict[str, Any]:
     """
     本机自动探测硬编/软编合成真 1080p 三轨混音成片（原生环境音 SFX + 旁白 VO + 自动闪避 BGM）：
     - 保持无 Body 调用 100% 向后兼容；
-    - 支持可选开启 10-bit BT.2020 HLG HDR（hdr_hlg=True）与底部 24%–26% 黄金安全区字幕（burn_subtitles=True）。
+    - 支持可选开启 10-bit BT.2020 HLG HDR（hdr_hlg=True）、底部黄金安全区字幕（burn_subtitles=True）与 VO 超长对齐策略（vo_sync_mode: pad | speed）；
+    - 支持 async_mode=True 走轻量异步任务中心。
     """
     req = body or RenderLocalRequest()
+    vo_sync_mode = _normalize_vo_sync_mode(req.vo_sync_mode)
     with db_ctx() as conn:
         proj, ep, items, _ = _collect_timeline(conn, episode_id)
     if not items:
@@ -557,7 +701,6 @@ def render_episode_local_preview(
 
     bundle = make_export_bundle_dir(proj["slug"], ep["ep_number"])
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    srt_path = export_srt(items, bundle / f"{proj['name']}_E{ep['ep_number']:02d}_字幕_{tag}.srt")
     suffix_tag = "Local1080p_HLG" if req.hdr_hlg else "Local1080p"
     out_mp4 = bundle / f"{proj['name']}_E{ep['ep_number']:02d}_{suffix_tag}_{tag}.mp4"
     bgm_vol = (
@@ -567,7 +710,20 @@ def render_episode_local_preview(
     )
     bgm_vol = max(0.0, min(1.5, bgm_vol))
 
-    try:
+    def _run_render_local(ctx: JobContext | None = None) -> dict[str, Any]:
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(progress_pct=12, stage_msg="正在导出时间线同步字幕...")
+        srt_kwargs = _filter_supported_kwargs(export_srt, {"vo_sync_mode": vo_sync_mode})
+        srt_path = export_srt(items, bundle / f"{proj['name']}_E{ep['ep_number']:02d}_字幕_{tag}.srt", **srt_kwargs)
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(progress_pct=25, stage_msg=f"正在本机渲染 1080p 三轨混音成片（VO 对齐：{vo_sync_mode}）...")
+
+        render_extra: dict[str, Any] = {}
+        if ctx is not None:
+            render_extra["progress_cb"] = _make_job_progress_cb(ctx)
+            render_extra["cancel_check"] = ctx.is_cancelled
         res = build_master_base_mp4(
             items,
             out_mp4,
@@ -575,37 +731,70 @@ def render_episode_local_preview(
             bgm_volume=bgm_vol,
             hdr_hlg=req.hdr_hlg,
             burn_srt_path=(srt_path if req.burn_subtitles else None),
+            vo_sync_mode=vo_sync_mode,
+            **_filter_supported_kwargs(build_master_base_mp4, render_extra),
         )
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(
+                progress_pct=94,
+                stage_msg="成片渲染完成，正在更新分集记录...",
+                log_line=f"{res.get('log', '')}\nSRT: {srt_path}",
+            )
+
+        ts = now_str()
+        with db_ctx() as conn:
+            if ctx is None:
+                conn.execute(
+                    """
+                    INSERT INTO render_jobs (episode_id, job_type, target_host, status, output_path, log_text, created_at, updated_at)
+                    VALUES (?, 'local_preview', 'local', 'done', ?, ?, ?, ?)
+                    """,
+                    (episode_id, res["output_path"], f"{res['log']}\nSRT: {srt_path}", ts, ts),
+                )
+            conn.execute(
+                "UPDATE episodes SET latest_output_path = ?, updated_at = ? WHERE id = ?",
+                (res["output_path"], ts, episode_id),
+            )
+        payload: dict[str, Any] = {
+            "output_path": res["output_path"],
+            "srt_path": str(srt_path.resolve()),
+            "mode": res.get("mode", "master_1080p"),
+            "encoder": res.get("encoder", ""),
+            "width": res.get("width", 0),
+            "height": res.get("height", 0),
+            "fps": res.get("fps", 30),
+            "hdr_hlg": bool(res.get("hdr_hlg", req.hdr_hlg)),
+            "burn_subtitles": bool(res.get("burned_subtitles", req.burn_subtitles)),
+            "vo_sync_mode": res.get("vo_sync_mode", vo_sync_mode),
+            "bgm_volume": bgm_vol,
+            "has_bgm": bool(res.get("has_bgm", False)),
+            "vo_count": int(res.get("vo_count", 0)),
+            "kept_sfx_shots": int(res.get("kept_sfx_shots", 0)),
+            "total_duration_sec": float(res.get("total_duration_sec", 0.0)),
+            "log": res.get("log", ""),
+        }
+        if "av_diff_sec" in res:
+            payload["av_diff_sec"] = res["av_diff_sec"]
+        return payload
+
+    use_async = bool(req.async_mode or async_mode)
+    if use_async:
+        job = submit_job(
+            "local_preview",
+            _run_render_local,
+            episode_id=episode_id,
+            target_host="local",
+            stage_msg=f"已排队：等待本机 1080p 三轨混音渲染（VO 对齐：{vo_sync_mode}）",
+        )
+        return {"ok": True, "async": True, "job_id": job["id"], "job": job}
+
+    try:
+        return _run_render_local(None)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-    ts = now_str()
-    with db_ctx() as conn:
-        conn.execute(
-            """
-            INSERT INTO render_jobs (episode_id, job_type, target_host, status, output_path, log_text, created_at, updated_at)
-            VALUES (?, 'local_preview', 'local', 'done', ?, ?, ?, ?)
-            """,
-            (episode_id, res["output_path"], f"{res['log']}\nSRT: {srt_path}", ts, ts),
-        )
-        conn.execute("UPDATE episodes SET latest_output_path = ?, updated_at = ? WHERE id = ?", (res["output_path"], ts, episode_id))
-    return {
-        "output_path": res["output_path"],
-        "srt_path": str(srt_path.resolve()),
-        "mode": res.get("mode", "master_1080p"),
-        "encoder": res.get("encoder", ""),
-        "width": res.get("width", 0),
-        "height": res.get("height", 0),
-        "fps": res.get("fps", 30),
-        "hdr_hlg": bool(res.get("hdr_hlg", req.hdr_hlg)),
-        "burn_subtitles": bool(res.get("burned_subtitles", req.burn_subtitles)),
-        "bgm_volume": bgm_vol,
-        "has_bgm": bool(res.get("has_bgm", False)),
-        "vo_count": int(res.get("vo_count", 0)),
-        "kept_sfx_shots": int(res.get("kept_sfx_shots", 0)),
-        "total_duration_sec": float(res.get("total_duration_sec", 0.0)),
-        "log": res.get("log", ""),
-    }
 
 
 @router.post("/episodes/{episode_id}/cleanup-drafts")
@@ -655,10 +844,12 @@ def _parse_bool_flag(val: Any) -> bool:
 def cli_generate_episode_tts(
     episode_id: int,
     body: CliGenerateTtsRequest | None = None,
+    async_mode: bool = False,
 ) -> dict[str, Any]:
     """
-    批量调用官方 gemini-api tts 为本集所有含台词/字幕的镜头生成旁白 WAV，
-    写入 shots.vo_file_path / shots.vo_source='tts' 与 episodes.vo_mode='tts'。
+    批量并发（受控线程池 max_workers=3）调用媒体引擎为本集所有含台词/字幕的镜头生成旁白 WAV，
+    写入 shots.vo_file_path / shots.vo_source='tts' 与 episodes.vo_mode='tts'；
+    支持 async_mode=True 走轻量异步任务中心并实时汇报完成镜数百分比。
     """
     req = body or CliGenerateTtsRequest()
     with db_ctx() as conn:
@@ -691,66 +882,139 @@ def cli_generate_episode_tts(
 
     voice = (req.voice or "Kore").strip() or "Kore"
     style_prompt = (req.style_prompt or "").strip()
-    generated: list[dict[str, Any]] = []
-    errors: list[dict[str, Any]] = []
-    total_cost = 0.0
 
-    for s, text in targets:
-        sno = int(s["shot_no"])
-        out_dir = make_shot_media_dir(proj["slug"], ep["ep_number"], sno)
-        stem = f"E{ep['ep_number']:02d}_S{sno:02d}_tts"
-        try:
+    def _run_tts(ctx: JobContext | None = None) -> dict[str, Any]:
+        total = len(targets)
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(progress_pct=5, stage_msg=f"正在并发生成 {total} 镜中文旁白 TTS（音色：{voice}）...")
+
+        generated_indexed: list[tuple[int, dict[str, Any]]] = []
+        errors: list[dict[str, Any]] = []
+        total_cost = 0.0
+        completed = 0
+
+        def _gen_one(order_idx: int, shot_item: dict[str, Any], tts_text: str) -> tuple[int, dict[str, Any], str, dict[str, Any]]:
+            if ctx is not None and ctx.is_cancelled():
+                raise JobCancelledError("批量 TTS 任务已取消")
+            sno = int(shot_item["shot_no"])
+            out_dir = make_shot_media_dir(proj["slug"], ep["ep_number"], sno)
+            stem = f"E{ep['ep_number']:02d}_S{sno:02d}_tts"
+            extra_cb: dict[str, Any] = {}
+            if ctx is not None:
+                extra_cb["cancel_check"] = ctx.is_cancelled
             res = cli_generate_tts(
-                text=text,
+                text=tts_text,
                 out_dir=out_dir,
                 voice=voice,
                 style_prompt=style_prompt,
                 stem=stem,
+                **_filter_supported_kwargs(cli_generate_tts, extra_cb),
             )
-            ts = now_str()
-            with db_ctx() as conn:
-                conn.execute(
-                    "UPDATE shots SET vo_file_path = ?, vo_source = 'tts', updated_at = ? WHERE id = ?",
-                    (res["file_path"], ts, s["id"]),
-                )
-            cost = float(res.get("est_cost_usd") or 0.0)
-            total_cost += cost
-            generated.append(
-                {
-                    "shot_id": s["id"],
-                    "shot_no": sno,
-                    "shot_title": s.get("shot_title") or "",
-                    "text": text,
-                    "file_path": res["file_path"],
-                    "filename": res.get("filename") or Path(res["file_path"]).name,
-                    "duration_sec": float(res.get("duration_sec") or 0.0),
-                    "est_cost_usd": cost,
-                    "model": res.get("model") or "",
-                    "voice": res.get("voice") or voice,
-                }
-            )
-        except Exception as exc:
-            errors.append({"shot_id": s["id"], "shot_no": sno, "error": str(exc)})
+            return order_idx, shot_item, tts_text, res
 
-    if not generated:
-        raise HTTPException(status_code=500, detail=f"批量生成 TTS 旁白全部失败：{errors[0]['error'] if errors else '未知错误'}")
+        max_workers = min(3, total)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fut_map = {
+                executor.submit(_gen_one, idx, s, text): (idx, s)
+                for idx, (s, text) in enumerate(targets)
+            }
+            for fut in as_completed(fut_map):
+                order_idx, s = fut_map[fut]
+                sno = int(s["shot_no"])
+                completed += 1
+                try:
+                    _, shot_item, tts_text, res = fut.result()
+                    ts = now_str()
+                    with db_ctx() as conn:
+                        conn.execute(
+                            "UPDATE shots SET vo_file_path = ?, vo_source = 'tts', updated_at = ? WHERE id = ?",
+                            (res["file_path"], ts, shot_item["id"]),
+                        )
+                    cost = float(res.get("est_cost_usd") or 0.0)
+                    total_cost += cost
+                    generated_indexed.append(
+                        (
+                            order_idx,
+                            {
+                                "shot_id": shot_item["id"],
+                                "shot_no": sno,
+                                "shot_title": shot_item.get("shot_title") or "",
+                                "text": tts_text,
+                                "file_path": res["file_path"],
+                                "filename": res.get("filename") or Path(res["file_path"]).name,
+                                "duration_sec": float(res.get("duration_sec") or 0.0),
+                                "est_cost_usd": cost,
+                                "model": res.get("model") or "",
+                                "voice": res.get("voice") or voice,
+                            },
+                        )
+                    )
+                    if ctx is not None:
+                        pct = min(95, 5 + int(90 * completed / total))
+                        ctx.update(
+                            progress_pct=pct,
+                            stage_msg=f"旁白 TTS 生成中：{completed}/{total} 镜（已完成 S{sno:02d}）",
+                            log_line=f"S{sno:02d} 旁白生成完成：{Path(res['file_path']).name}",
+                        )
+                except JobCancelledError:
+                    for pending in fut_map:
+                        pending.cancel()
+                    raise
+                except Exception as exc:
+                    errors.append({"shot_id": s["id"], "shot_no": sno, "error": str(exc)})
+                    if ctx is not None:
+                        pct = min(95, 5 + int(90 * completed / total))
+                        ctx.update(
+                            progress_pct=pct,
+                            stage_msg=f"旁白 TTS 生成中：{completed}/{total} 镜（S{sno:02d} 失败）",
+                            log_line=f"S{sno:02d} 旁白生成失败：{exc}",
+                        )
 
-    with db_ctx() as conn:
-        conn.execute("UPDATE episodes SET vo_mode = 'tts', updated_at = ? WHERE id = ?", (now_str(), episode_id))
+                if ctx is not None and ctx.is_cancelled():
+                    for pending in fut_map:
+                        pending.cancel()
+                    raise JobCancelledError("批量 TTS 任务已取消")
 
-    total_cost_rounded = round(total_cost, 4)
-    return {
-        "episode_id": episode_id,
-        "vo_mode": "tts",
-        "voice": voice,
-        "generated_count": len(generated),
-        "failed_count": len(errors),
-        "skipped_shots": skipped_shots,
-        "total_cost_usd": total_cost_rounded,
-        "est_cost_usd": total_cost_rounded,
-        "shots": generated,
-        "errors": errors,
-    }
+        generated_indexed.sort(key=lambda pair: pair[0])
+        generated = [item for _, item in generated_indexed]
+        if not generated:
+            raise RuntimeError(f"批量生成 TTS 旁白全部失败：{errors[0]['error'] if errors else '未知错误'}")
+
+        with db_ctx() as conn:
+            conn.execute("UPDATE episodes SET vo_mode = 'tts', updated_at = ? WHERE id = ?", (now_str(), episode_id))
+
+        total_cost_rounded = round(total_cost, 4)
+        return {
+            "episode_id": episode_id,
+            "vo_mode": "tts",
+            "voice": voice,
+            "generated_count": len(generated),
+            "failed_count": len(errors),
+            "skipped_shots": skipped_shots,
+            "total_cost_usd": total_cost_rounded,
+            "est_cost_usd": total_cost_rounded,
+            "shots": generated,
+            "errors": errors,
+        }
+
+    use_async = bool(req.async_mode or async_mode)
+    if use_async:
+        job = submit_job(
+            "cli_tts",
+            _run_tts,
+            episode_id=episode_id,
+            target_host="local",
+            stage_msg=f"已排队：等待并发生成 {len(targets)} 镜中文旁白 TTS",
+        )
+        return {"ok": True, "async": True, "job_id": job["id"], "job": job}
+
+    try:
+        return _run_tts(None)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 @router.post("/shots/{shot_id}/upload-vo")
@@ -1017,6 +1281,13 @@ def qc_inspect_episode_videos(
         except Exception:
             overview_sheet_path = ""
 
+    if overview_sheet_path:
+        with db_ctx() as conn:
+            conn.execute(
+                "UPDATE episodes SET qc_overview_path = ?, updated_at = ? WHERE id = ?",
+                (overview_sheet_path, now_str(), episode_id),
+            )
+
     return {
         "episode_id": episode_id,
         "resolution_filter": res_filter or "latest",
@@ -1025,6 +1296,7 @@ def qc_inspect_episode_videos(
         "warning_count": warning_count,
         "missing_shots": missing_shots,
         "overview_sheet_path": overview_sheet_path,
+        "qc_overview_path": overview_sheet_path,
         "shots": inspected,
     }
 
@@ -1124,10 +1396,12 @@ def _collect_cover_refs_and_prompts(
 def cli_generate_episode_covers(
     episode_id: int,
     body: CliGenerateCoversRequest | None = None,
+    async_mode: bool = False,
 ) -> dict[str, Any]:
     """
-    基于本集高光首帧与绑定资产，调官方 CLI 生成 9:16（短视频竖屏）与 3:4（图文/小红书）各 2 张候选封面，
-    拼成编号对比总览图并写入 episodes.cover_candidates_json。
+    基于本集高光首帧与绑定资产，调媒体引擎生成 9:16（短视频竖屏）与 3:4（图文/小红书）各 2 张候选封面，
+    拼成编号对比总览图并写入 episodes.cover_candidates_json 与 episodes.covers_sheet_path；
+    支持 async_mode=True 走轻量异步任务中心。
     """
     req = body or CliGenerateCoversRequest()
     with db_ctx() as conn:
@@ -1151,7 +1425,15 @@ def cli_generate_episode_covers(
     cover_dir.mkdir(parents=True, exist_ok=True)
     count_per = max(1, min(4, int(req.count_per_ratio or 2)))
 
-    try:
+    def _run_covers(ctx: JobContext | None = None) -> dict[str, Any]:
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(progress_pct=10, stage_msg=f"正在生成 9:16 与 3:4 双比例候选封面（各 {count_per} 张）...")
+        extra_cb: dict[str, Any] = {}
+        if ctx is not None:
+            extra_cb["progress_cb"] = _make_job_progress_cb(ctx)
+            extra_cb["cancel_check"] = ctx.is_cancelled
+
         res = cli_generate_covers(
             prompt_916=prompt_916,
             prompt_34=prompt_34,
@@ -1159,99 +1441,127 @@ def cli_generate_episode_covers(
             out_dir=cover_dir,
             count_per_ratio=count_per,
             image_size=req.image_size,
+            **_filter_supported_kwargs(cli_generate_covers, extra_cb),
         )
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(progress_pct=82, stage_msg="双比例候选封面已落盘，正在拼接编号对比总览图...")
+
+        covers_9_16 = res.get("covers_9_16") or []
+        covers_3_4 = res.get("covers_3_4") or []
+        all_candidates: list[dict[str, Any]] = []
+        sheet_entries: list[dict[str, Any]] = []
+
+        idx = 1
+        for j, c in enumerate(covers_9_16, start=1):
+            code = chr(64 + j) if j <= 26 else str(j)
+            lbl = f"#{idx} 抖音/视频号 {code}"
+            item = {
+                "index": idx,
+                "ratio": "9:16",
+                "platform": "抖音/视频号",
+                "label": lbl,
+                "path": c["path"],
+                "filename": c.get("filename") or Path(c["path"]).name,
+                "width": c.get("width", 0),
+                "height": c.get("height", 0),
+            }
+            all_candidates.append(item)
+            sheet_entries.append(
+                {
+                    "label": lbl,
+                    "path": c["path"],
+                    "badge": "9:16",
+                    "caption": f"抖音/视频号 9:16 · {c.get('width', 0)}x{c.get('height', 0)}",
+                }
+            )
+            idx += 1
+
+        for j, c in enumerate(covers_3_4, start=1):
+            code = chr(64 + j) if j <= 26 else str(j)
+            lbl = f"#{idx} 小红书 {code}"
+            item = {
+                "index": idx,
+                "ratio": "3:4",
+                "platform": "小红书",
+                "label": lbl,
+                "path": c["path"],
+                "filename": c.get("filename") or Path(c["path"]).name,
+                "width": c.get("width", 0),
+                "height": c.get("height", 0),
+            }
+            all_candidates.append(item)
+            sheet_entries.append(
+                {
+                    "label": lbl,
+                    "path": c["path"],
+                    "badge": "3:4",
+                    "caption": f"小红书 3:4 · {c.get('width', 0)}x{c.get('height', 0)}",
+                }
+            )
+            idx += 1
+
+        tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+        sheet_jpg = cover_dir / f"E{ep['ep_number']:02d}_covers_sheet_{tag}.jpg"
+        sheet_path = ""
+        if sheet_entries:
+            try:
+                sheet_res = build_contact_sheet(
+                    sheet_entries,
+                    sheet_jpg,
+                    title=f"{proj['name']} · 第{ep['ep_number']:02d}集 双比例封面候选对比",
+                    cols=2,
+                )
+                sheet_path = str(Path(sheet_res.get("output_path") or sheet_jpg).resolve())
+            except Exception:
+                sheet_path = ""
+
+        ts = now_str()
+        with db_ctx() as conn:
+            if sheet_path:
+                conn.execute(
+                    "UPDATE episodes SET cover_candidates_json = ?, covers_sheet_path = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(all_candidates, ensure_ascii=False), sheet_path, ts, episode_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE episodes SET cover_candidates_json = ?, updated_at = ? WHERE id = ?",
+                    (json.dumps(all_candidates, ensure_ascii=False), ts, episode_id),
+                )
+            updated_ep = dict(conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone())
+
+        total_cost = round(float(res.get("total_cost_usd") or 0.0), 4)
+        return {
+            "episode_id": episode_id,
+            "sheet_path": sheet_path,
+            "covers_sheet_path": sheet_path,
+            "output_path": sheet_path,
+            "covers_9_16": covers_9_16,
+            "covers_3_4": covers_3_4,
+            "candidates": all_candidates,
+            "ref_count": len(ref_paths),
+            "total_cost_usd": total_cost,
+            "est_cost_usd": total_cost,
+            "episode": updated_ep,
+        }
+
+    use_async = bool(req.async_mode or async_mode)
+    if use_async:
+        job = submit_job(
+            "cli_covers",
+            _run_covers,
+            episode_id=episode_id,
+            target_host="local",
+            stage_msg=f"已排队：等待生成第 {ep['ep_number']:02d} 集双比例封面候选",
+        )
+        return {"ok": True, "async": True, "job_id": job["id"], "job": job}
+
+    try:
+        return _run_covers(None)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=f"生成双比例封面失败：{exc}")
-
-    covers_9_16 = res.get("covers_9_16") or []
-    covers_3_4 = res.get("covers_3_4") or []
-    all_candidates: list[dict[str, Any]] = []
-    sheet_entries: list[dict[str, Any]] = []
-
-    idx = 1
-    for j, c in enumerate(covers_9_16, start=1):
-        code = chr(64 + j) if j <= 26 else str(j)
-        lbl = f"#{idx} 抖音/视频号 {code}"
-        item = {
-            "index": idx,
-            "ratio": "9:16",
-            "platform": "抖音/视频号",
-            "label": lbl,
-            "path": c["path"],
-            "filename": c.get("filename") or Path(c["path"]).name,
-            "width": c.get("width", 0),
-            "height": c.get("height", 0),
-        }
-        all_candidates.append(item)
-        sheet_entries.append(
-            {
-                "label": lbl,
-                "path": c["path"],
-                "badge": "9:16",
-                "caption": f"抖音/视频号 9:16 · {c.get('width', 0)}x{c.get('height', 0)}",
-            }
-        )
-        idx += 1
-
-    for j, c in enumerate(covers_3_4, start=1):
-        code = chr(64 + j) if j <= 26 else str(j)
-        lbl = f"#{idx} 小红书 {code}"
-        item = {
-            "index": idx,
-            "ratio": "3:4",
-            "platform": "小红书",
-            "label": lbl,
-            "path": c["path"],
-            "filename": c.get("filename") or Path(c["path"]).name,
-            "width": c.get("width", 0),
-            "height": c.get("height", 0),
-        }
-        all_candidates.append(item)
-        sheet_entries.append(
-            {
-                "label": lbl,
-                "path": c["path"],
-                "badge": "3:4",
-                "caption": f"小红书 3:4 · {c.get('width', 0)}x{c.get('height', 0)}",
-            }
-        )
-        idx += 1
-
-    tag = datetime.now().strftime("%Y%m%d_%H%M%S")
-    sheet_jpg = cover_dir / f"E{ep['ep_number']:02d}_covers_sheet_{tag}.jpg"
-    sheet_path = ""
-    if sheet_entries:
-        try:
-            sheet_res = build_contact_sheet(
-                sheet_entries,
-                sheet_jpg,
-                title=f"{proj['name']} · 第{ep['ep_number']:02d}集 双比例封面候选对比",
-                cols=2,
-            )
-            sheet_path = str(Path(sheet_res.get("output_path") or sheet_jpg).resolve())
-        except Exception:
-            sheet_path = ""
-
-    ts = now_str()
-    with db_ctx() as conn:
-        conn.execute(
-            "UPDATE episodes SET cover_candidates_json = ?, updated_at = ? WHERE id = ?",
-            (json.dumps(all_candidates, ensure_ascii=False), ts, episode_id),
-        )
-        updated_ep = dict(conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone())
-
-    total_cost = round(float(res.get("total_cost_usd") or 0.0), 4)
-    return {
-        "episode_id": episode_id,
-        "sheet_path": sheet_path,
-        "covers_9_16": covers_9_16,
-        "covers_3_4": covers_3_4,
-        "candidates": all_candidates,
-        "ref_count": len(ref_paths),
-        "total_cost_usd": total_cost,
-        "est_cost_usd": total_cost,
-        "episode": updated_ep,
-    }
 
 
 @router.post("/episodes/{episode_id}/select-cover")

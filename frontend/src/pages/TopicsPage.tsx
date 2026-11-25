@@ -62,7 +62,13 @@ export const TopicsPage: React.FC<Props> = ({
 
   const [source, setSource] = useState('douyin');
   const [hotItems, setHotItems] = useState<HotItem[]>([]);
-  const [hotMeta, setHotMeta] = useState<{ fetched_at: string; cached: boolean; latency_ms: number } | null>(null);
+  const [hotMeta, setHotMeta] = useState<{
+    fetched_at: string;
+    cached: boolean;
+    latency_ms: number;
+    degraded?: boolean;
+    warning?: string;
+  } | null>(null);
   const [hotDisabledByServer, setHotDisabledByServer] = useState(false);
   const [loadingHot, setLoadingHot] = useState(false);
   const [selectedHot, setSelectedHot] = useState<Set<number>>(new Set());
@@ -134,6 +140,8 @@ export const TopicsPage: React.FC<Props> = ({
         fetched_at?: string;
         cached?: boolean;
         latency_ms?: number;
+        degraded?: boolean;
+        warning?: string;
       }>(`/api/hot/${src}?force=${force ? 'true' : 'false'}`);
       if (res.enabled === false) {
         setHotDisabledByServer(true);
@@ -146,10 +154,18 @@ export const TopicsPage: React.FC<Props> = ({
           fetched_at: res.fetched_at || '',
           cached: Boolean(res.cached),
           latency_ms: res.latency_ms || 0,
+          degraded: Boolean(res.degraded),
+          warning: res.warning || '',
         });
       }
     } catch (err: any) {
-      notify(err.message, 'err');
+      setHotMeta({
+        fetched_at: '',
+        cached: false,
+        latency_ms: 0,
+        degraded: true,
+        warning: err?.message || '当前第三方热榜源暂不可达，请稍后重试或改用上方 AI 联网搜选题。',
+      });
     } finally {
       setLoadingHot(false);
     }
@@ -598,7 +614,13 @@ export const TopicsPage: React.FC<Props> = ({
               <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
                 <span>
                   {hotMeta
-                    ? `${hotMeta.cached ? '缓存命中' : `直连 ${hotMeta.latency_ms}ms`} · ${hotMeta.fetched_at.slice(11)}`
+                    ? `${
+                        hotMeta.degraded
+                          ? '降级缓存'
+                          : hotMeta.cached
+                            ? '缓存命中'
+                            : `直连 ${hotMeta.latency_ms}ms`
+                      }${hotMeta.fetched_at ? ` · ${hotMeta.fetched_at.slice(11)}` : ''}`
                     : '加载中...'}
                 </span>
                 <button
@@ -610,6 +632,12 @@ export const TopicsPage: React.FC<Props> = ({
                   {scoring ? 'AI 评估中...' : `送 AI 双轨打分 (${selectedHot.size})`}
                 </button>
               </div>
+
+              {hotMeta?.degraded && (
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-900 leading-relaxed">
+                  ⚠️ {hotMeta.warning || '当前热榜源访问波动，已自动降级展示最近一次历史缓存（不影响 AI 搜题与手动记灵感）。'}
+                </div>
+              )}
             </div>
 
             <div className="flex-1 overflow-y-auto divide-y divide-slate-100">

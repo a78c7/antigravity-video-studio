@@ -266,7 +266,7 @@ DEFAULT_PROMPT_TEMPLATES: dict[str, dict[str, str]] = {
 }
 
 
-# 仅当 projects 表为空时注入 1 个纯中立演示骨架，帮助新用户 1 分钟直观理解全流程结构
+# 仅当 projects 表为空时注入 1 个纯中立演示剧目与完整只读示范样例集，帮助新用户 1 分钟直观理解全流程结构
 SEED_PROJECTS: list[dict[str, Any]] = [
     {
         "name": "示例剧目：3D 虚拟搭档微短剧",
@@ -274,35 +274,356 @@ SEED_PROJECTS: list[dict[str, Any]] = [
         "track": "奇幻轻喜剧（通用示例）",
         "visual_mode": "电影级写实实景 + 3D 精致原创虚拟搭档",
         "aspect_ratio": "9:16",
-        "target_duration_sec": 70,
+        "target_duration_sec": 62,
         "global_style_prompt": (
             "Cinematic vertical 9:16 live-action film, warm golden-hour and crisp twilight atmospheric lighting, "
             "photorealistic real-world architecture and tactile materials seamlessly blended with a stylized 3D collectible companion, "
             "matching color grade, grounded contact shadows, natural ambient occlusion, subtle 35mm film grain, ARRI Alexa look"
         ),
         "description": (
-            "开箱通用示例骨架：采用「电影级实景 × 固定 3D 原创搭档」路线，天然规避真人长对话恐怖谷并沉淀跨集辨识度。"
-            "你可以直接编辑本剧目设定，或新建剧情、科幻、萌宠、美食、旅行、科普等任意题材剧目。"
+            "开箱通用示例剧目（内置完整示范资产、60s 示范剧本与 6 镜分镜样例）：采用「电影级实景 × 固定 3D 原创搭档」路线，"
+            "天然规避真人长对话恐怖谷并沉淀跨集辨识度。你可以直接浏览试跑，或新建剧情、科幻、萌宠、美食、旅行、科普等任意题材剧目。"
         ),
         "season_outline": json.dumps(
             [
-                {"ep": 1, "title": "（示例占位）第 1 集：意外闯入的微小搭档", "hook": "前3秒反常识视觉奇观引发悬念", "status": "planned"},
-                {"ep": 2, "title": "（示例占位）第 2 集：消失的关键物件", "hook": "微距细节触发限时解谜困境", "status": "planned"},
-                {"ep": 3, "title": "（示例占位）第 3 集：意料之外的反转答卷", "hook": "首尾道具呼应完成情绪升华与下季钩子", "status": "planned"},
+                {"ep": 1, "title": "第1集（示范样例）：屋顶上的星图信号", "hook": "雨后蓝调天台，星光小猫爪按黄铜星盘点亮整片夜空星轨", "status": "storyboard_ready"},
+                {"ep": 2, "title": "（示例占位）第 2 集：老钟楼的红色回声", "hook": "星图第二红点引导小猫潜入熄灯老钟楼解开齿轮机关", "status": "planned"},
+                {"ep": 3, "title": "（示例占位）第 3 集：重启失落的观星仪", "hook": "首尾道具呼应点亮整座城市天际线并留下下季钩子", "status": "planned"},
             ],
             ensure_ascii=False,
         ),
         "continuity_ledger": json.dumps(
             {
-                "main_characters": [],
-                "recurring_locations": [],
-                "open_cliffhangers": [],
-                "notes": "开拍前可在此登记固定主角外观锚点、口头禅、防穿帮禁忌与主线伏笔；写下一集剧本时自动带入 AI 上下文防止吃书。",
+                "main_characters": [
+                    "角色_星光小猫01 (@StarCat)：28cm 星空蓝丝绒质感 3D 原创小猫搭档，琥珀金眼瞳、半透明微光耳朵、佩戴迷你黄铜指南针项圈"
+                ],
+                "recurring_locations": [
+                    "场景_霓虹天台01 (@NeonRoof)：雨后蓝调黄昏城市天台，湿润水泥女儿墙倒映暖黄灯笼与青蓝远景霓虹"
+                ],
+                "open_cliffhangers": [
+                    "星图投影边缘突然亮起第二个闪烁红点，指向城市另一端熄灯的老钟楼"
+                ],
+                "notes": "开拍前可在此登记固定主角外观锚点、防穿帮护盾与主线伏笔；写下一集剧本时自动带入 AI 上下文防止吃书。",
             },
             ensure_ascii=False,
         ),
     },
 ]
+
+# 示范剧目（demo-companion-drama）开箱只读样例资产（100% 中立零隐私，含英文锁词与永久防穿帮护盾）
+SEED_DEMO_ASSETS: list[dict[str, Any]] = [
+    {
+        "asset_type": "character",
+        "name": "角色_星光小猫01",
+        "flow_tag": "@StarCat",
+        "en_anchor_prompt": (
+            "A stylized 3D collectible midnight-blue starry kitten companion, 28cm tall, soft velvet fur with subtle constellation shimmer, "
+            "translucent glowing stardust ears, expressive amber-gold eyes, wearing a tiny antique brass compass collar, "
+            "consistent anatomy and proportions, physically grounded contact shadows"
+        ),
+        "negative_guard_en": "NO human clothing, NO distorted extra limbs, NO flat 2D cartoon outline, NO uncanny human teeth",
+        "voice_mode": "flow_sfx",
+        "voice_en_desc": "Soft curious kitten purrs and gentle musical chime sighs, no spoken words",
+        "notes": "示范角色卡：固定风格化 3D 原创虚拟搭档，避开真人正脸长对话恐怖谷；棚拍定妆建议使用纯净浅灰背景。",
+    },
+    {
+        "asset_type": "landmark",
+        "name": "场景_霓虹天台01",
+        "flow_tag": "@NeonRoof",
+        "en_anchor_prompt": (
+            "A cinematic twilight urban rooftop terrace right after summer rain, wet dark concrete parapet reflecting warm amber string lanterns "
+            "and cool cyan distant skyline bokeh, potted greenery along the rail, realistic 35mm architectural depth and natural atmospheric haze"
+        ),
+        "negative_guard_en": "NO legible gibberish neon signage text, NO warped skyscraper geometry, NO oversaturated magenta color cast",
+        "voice_mode": "flow_sfx",
+        "voice_en_desc": "",
+        "notes": "示范场景卡：锁定蓝调时刻冷暖光比，作为整集唯一核心主景大幅降低跨镜光影漂移。",
+    },
+    {
+        "asset_type": "prop",
+        "name": "道具_发光星图01",
+        "flow_tag": "@StarMap",
+        "en_anchor_prompt": (
+            "A palm-sized antique brass celestial astrolabe disc with delicate engraved concentric rings, projecting warm-gold holographic starlight "
+            "constellation arcs and floating luminous dust motes above its weathered metallic surface, macro tactile reflections"
+        ),
+        "negative_guard_en": "NO garbled text or random numbers on the dial, NO cheap glossy plastic texture, NO blinding blown-out lens flare",
+        "voice_mode": "flow_sfx",
+        "voice_en_desc": "",
+        "notes": "示范核心道具：贯穿开局 0-3s 钩子、中段首尾双帧形变高潮与片尾伏笔的关键发光器物。",
+    },
+]
+
+# 示范剧目第 1 集完整样例（62s · 6 镜，覆盖图生视频、首尾双帧插值、原生环境音与中文短字幕）
+SEED_DEMO_EPISODE: dict[str, Any] = {
+    "ep_number": 1,
+    "title": "第1集（示范样例）：屋顶上的星图信号",
+    "hook_0_3s": "雨后蓝调天台，一只巴掌大的星光小猫抬爪按下生锈的黄铜星盘，积水里瞬间点亮金色全息星轨。",
+    "ending_cta": "如果你在城市天台捡到这枚会发光的星图，你最想先输入哪一个坐标？评论区写下你的目的地。",
+    "next_ep_hook": "星图光环边缘突然跳出第二颗微弱闪烁的红点，指向城市另一端已经熄灯的老钟楼。",
+    "script_text": (
+        "【第1集（示范样例）：屋顶上的星图信号｜总时长约 62 秒】\n\n"
+        "00:00–00:10（0-3s 强钩子开局）\n"
+        "雨后黄昏的霓虹天台，积水倒映着微凉的城市灯火。巴掌大的星光小猫（@StarCat）轻巧跳上湿润的水泥墙沿，"
+        "好奇地低头用前爪按向一枚半掩在积水里的旧黄铜星图（@StarMap）。指尖触碰的刹那，暗淡铜盘发出一声清脆机括鸣响，金光破水而出。\n\n"
+        "00:10–00:20（空间建立）\n"
+        "低角度贴地滑轨扫过天台积水，细密水纹将远方青蓝霓虹与近处暖金星芒揉成一幅流动星海，风铃与远处微弱车流交织出安静又神秘的氛围。\n\n"
+        "00:20–00:30（主角交互与目标）\n"
+        "近景特写：星光小猫歪着头，项圈上的迷你指南针指针突然疯狂旋转后定格。它用肉垫小心拨动星图外圈刻度，金属环咔哒咬合。\n"
+        "旁白：「它找了整整七个雨夜，终于听见第一声回响。」\n\n"
+        "00:30–00:42（中段视觉高潮 · 首尾双帧插值形变）\n"
+        "星图表面光线骤然向上舒展，化作半人高的立体金色星座拱门悬浮在天台半空，光尘随晚风轻旋，小猫仰头望着倒映在琥珀色眼瞳里的星河。\n\n"
+        "00:42–00:52（情绪升华）\n"
+        "远景缓拉：天台一隅被温柔金光笼罩，城市的喧嚣在脚下沉静下来，星光小猫坐在星图旁，耳朵微微抖动聆听晚风。\n"
+        "旁白：「原来迷路的不只是信号，还有忘了抬头看星星的人。」\n\n"
+        "00:52–01:02（片尾双钩 · 伏笔与互动）\n"
+        "极特写推进：原本平静旋转的金色星图边缘，忽然亮起一颗急促闪烁的赤红坐标点，小猫瞳孔一缩望向远方夜幕，画面定格留白。"
+    ),
+    "continuity_summary": "本集建立 @StarCat 与 @StarMap 的发光共振设定；主场景固定在 @NeonRoof 蓝调雨后天台；片尾抛出老钟楼红色新信号伏笔。",
+    "bgm_prompt": (
+        "Cinematic magical realism short film score, delicate felt piano arpeggios and crystalline celesta chimes "
+        "swelling into warm lush ambient strings at 35 seconds, subtle twilight rain atmosphere, 92 BPM, "
+        "hopeful nostalgic ending resolve at 60 seconds, strictly instrumental, no vocals"
+    ),
+    "bgm_volume": 0.25,
+    "status": "storyboard_ready",
+    "vo_mode": "pending",
+}
+
+SEED_DEMO_SHOTS: list[dict[str, Any]] = [
+    {
+        "shot_no": 1,
+        "shot_title": "雨后星盘初亮",
+        "camera_type": "近景",
+        "duration_sec": 10,
+        "flow_mode": "omni12_i2v",
+        "ref_tags": ["@StarCat", "@NeonRoof", "@StarMap"],
+        "cn_action_desc": "雨后蓝调天台水泥女儿墙上，星光小猫轻落积水旁，抬起左爪按下生锈的黄铜星盘，铜盘瞬间迸出暖金色星纹微光。",
+        "cn_dialogue": "雨刚停，天台积水里亮起了一枚旧星盘。",
+        "subtitle_text": "雨刚停，天台积水里亮起了一枚旧星盘。",
+        "frame_prompt_en": (
+            "Close-up cinematic still on a rain-wet concrete rooftop parapet at blue hour, @StarCat crouched curiously beside a shallow puddle "
+            "gently pressing one tiny paw onto @StarMap resting in the water, warm gold sparks starting to awaken along the brass rings, "
+            "misty twilight skyline of @NeonRoof softly blurred behind"
+        ),
+        "end_frame_prompt_en": "",
+        "video_prompt_en": (
+            "Slow push-in close-up camera move. @StarCat tilts its head and gently presses its front paw onto @StarMap in the rooftop puddle; "
+            "water ripples outward as intricate golden starlight ignites across the brass engravings, casting warm reflections onto the kitten's amber eyes."
+        ),
+        "audio_strategy": "keep_flow_sfx",
+    },
+    {
+        "shot_no": 2,
+        "shot_title": "积水星轨倒影",
+        "camera_type": "低角度特写",
+        "duration_sec": 10,
+        "flow_mode": "veo31_lite",
+        "ref_tags": ["@NeonRoof", "@StarMap"],
+        "cn_action_desc": "贴近地面的低角度慢滑轨镜头，掠过天台雨水涟漪，黄铜星盘的金光与远景青蓝城市霓虹倒影在水面交织旋转。",
+        "cn_dialogue": "涟漪散开时，整座城市的灯光都成了背景。",
+        "subtitle_text": "涟漪散开时，整座城市的灯光都成了背景。",
+        "frame_prompt_en": (
+            "Low-angle macro reflection shot just above a rooftop rain puddle on @NeonRoof, @StarMap glowing softly at the edge of the water "
+            "while concentric ripples distort warm amber lantern glow and cool cyan skyline bokeh into swirling celestial streaks"
+        ),
+        "end_frame_prompt_en": "",
+        "video_prompt_en": (
+            "Gentle low-angle lateral tracking glide right over the puddle surface on @NeonRoof. "
+            "Fine raindrops fall sporadically, sending crisp concentric rings across the golden light emitted by @StarMap and the distant twilight skyline reflections."
+        ),
+        "audio_strategy": "keep_flow_sfx",
+    },
+    {
+        "shot_no": 3,
+        "shot_title": "小猫校准刻度",
+        "camera_type": "特写",
+        "duration_sec": 10,
+        "flow_mode": "omni12_i2v",
+        "ref_tags": ["@StarCat", "@StarMap"],
+        "cn_action_desc": "星光小猫专注低头，胸前迷你指南针指针快速转动后停稳，它用小爪拨动黄铜星图外环，齿轮咔哒对齐。",
+        "cn_dialogue": "它找了七个雨夜，终于听见第一声回响。",
+        "subtitle_text": "它找了七个雨夜，终于听见第一声回响。",
+        "frame_prompt_en": (
+            "Intimate tight close-up of @StarCat looking down intently with glistening amber-gold eyes, its miniature brass compass collar needle aligned, "
+            "small velvety paw nudging the outer engraved ring of @StarMap as warm golden light beams upward onto its whiskers"
+        ),
+        "end_frame_prompt_en": "",
+        "video_prompt_en": (
+            "Subtle handheld macro camera settle. @StarCat carefully nudges the outer brass ring of @StarMap until the concentric disc clicks smoothly into place; "
+            "its translucent stardust ears perk forward in wonder as luminous motes drift upward."
+        ),
+        "audio_strategy": "mute_for_local_vo",
+    },
+    {
+        "shot_no": 4,
+        "shot_title": "星图凌空展开",
+        "camera_type": "中景",
+        "duration_sec": 12,
+        "flow_mode": "frames_to_video",
+        "ref_tags": ["@StarCat", "@NeonRoof", "@StarMap"],
+        "cn_action_desc": "首尾双帧无缝形变：休眠微光的黄铜星盘向上展开为悬浮半空的立体金色星座光环，星光小猫仰望流动星海。",
+        "cn_dialogue": "三道星轨凌空展开，把黄昏点成银河。",
+        "subtitle_text": "三道星轨凌空展开，把黄昏点成银河。",
+        "frame_prompt_en": (
+            "Medium vertical shot on @NeonRoof at twilight: @StarCat sits alertly beside @StarMap resting flat on the wet parapet, "
+            "a compact sphere of warm-gold starlight just beginning to rise above the brass disc"
+        ),
+        "end_frame_prompt_en": (
+            "Medium vertical shot on @NeonRoof at twilight with identical framing: @StarMap has unfurled into a towering graceful 3D holographic golden constellation arch "
+            "floating above the parapet with swirling stardust filaments, while @StarCat gazes upward in awe bathed in warm amber light"
+        ),
+        "video_prompt_en": (
+            "Smooth continuous vertical tilt-up transformation between the opening and closing keyframes. "
+            "From @StarMap on the parapet of @NeonRoof, delicate golden constellation arcs bloom smoothly upward into an airy floating holographic star dome while @StarCat lifts its gaze following the rising stardust."
+        ),
+        "audio_strategy": "keep_flow_sfx",
+    },
+    {
+        "shot_no": 5,
+        "shot_title": "天台余韵远景",
+        "camera_type": "远景",
+        "duration_sec": 10,
+        "flow_mode": "veo31_lite",
+        "ref_tags": ["@StarCat", "@NeonRoof"],
+        "cn_action_desc": "镜头缓慢后拉展现整座暮色天台与深蓝城市天际线，暖金色星图微光包裹着安静坐着的小猫，晚风轻拂绿植。",
+        "cn_dialogue": "原来迷路的不只是信号，还有忘了抬头的人。",
+        "subtitle_text": "原来迷路的不只是信号，还有忘了抬头的人。",
+        "frame_prompt_en": (
+            "Wide poetic vertical establishing shot of @NeonRoof overlooking a misty twilight cityscape, "
+            "@StarCat sitting peacefully in silhouette beside a warm golden halo of floating starlight dust on the wet parapet, "
+            "gentle evening breeze rustling rooftop plants, balanced teal-and-amber film grade"
+        ),
+        "end_frame_prompt_en": "",
+        "video_prompt_en": (
+            "Slow graceful pull-back crane shot away from the parapet of @NeonRoof. "
+            "Evening breeze gently sways rooftop foliage while floating golden starlight dust drifts lazily around @StarCat against the vast quiet blue-hour city horizon."
+        ),
+        "audio_strategy": "mute_for_local_vo",
+    },
+    {
+        "shot_no": 6,
+        "shot_title": "第二红点伏笔",
+        "camera_type": "极特写",
+        "duration_sec": 10,
+        "flow_mode": "omni12_i2v",
+        "ref_tags": ["@StarCat", "@StarMap"],
+        "cn_action_desc": "金色全息星图边缘忽然亮起第二颗有节奏闪烁的赤红坐标点，小猫耳朵瞬间竖起转头望向夜幕深处。",
+        "cn_dialogue": "等等，星图边缘亮起了第二颗红色坐标。",
+        "subtitle_text": "等等，星图边缘亮起了第二颗红色坐标。",
+        "frame_prompt_en": (
+            "Extreme close-up of the glowing golden holographic rings hovering over @StarMap, with a single crisp pulsing crimson beacon dot "
+            "appearing on the outer orbital arc, @StarCat's alert silhouette and wide amber eyes catching the red glint in the foreground"
+        ),
+        "end_frame_prompt_en": "",
+        "video_prompt_en": (
+            "Slow suspenseful rack-focus push-in. On the outer golden ring of @StarMap, a tiny crimson signal dot blinks steadily three times; "
+            "@StarCat's ears twitch sharply as it turns its gaze toward the distant dark horizon, ending on a crisp dramatic beat."
+        ),
+        "audio_strategy": "keep_flow_sfx",
+    },
+]
+
+
+def _seed_demo_sample_set(conn: sqlite3.Connection, project_id: int, ts: str) -> None:
+    """为示例剧目幂等注入 3 个中立示范资产、1 个 60s 示范分集与 6 个完整示范分镜（总时长 62s）"""
+    existing_assets = conn.execute(
+        "SELECT id, flow_tag FROM assets WHERE project_id = ?",
+        (project_id,),
+    ).fetchall()
+    tag_to_id: dict[str, int] = {str(r["flow_tag"]): int(r["id"]) for r in existing_assets if r["flow_tag"]}
+
+    if not existing_assets:
+        for asset in SEED_DEMO_ASSETS:
+            cur = conn.execute(
+                """
+                INSERT INTO assets (
+                    project_id, asset_type, name, flow_tag, raw_image_path, clean_image_path,
+                    en_anchor_prompt, negative_guard_en, voice_mode, voice_en_desc,
+                    voice_clone_sample_path, notes, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, '', '', ?, ?, ?, ?, '', ?, ?, ?)
+                """,
+                (
+                    project_id,
+                    asset["asset_type"],
+                    asset["name"],
+                    asset["flow_tag"],
+                    asset["en_anchor_prompt"],
+                    asset["negative_guard_en"],
+                    asset["voice_mode"],
+                    asset["voice_en_desc"],
+                    asset["notes"],
+                    ts,
+                    ts,
+                ),
+            )
+            tag_to_id[asset["flow_tag"]] = int(cur.lastrowid)
+
+    ep_count = conn.execute(
+        "SELECT COUNT(*) AS c FROM episodes WHERE project_id = ?",
+        (project_id,),
+    ).fetchone()["c"]
+    if ep_count > 0:
+        return
+
+    ep_cur = conn.execute(
+        """
+        INSERT INTO episodes (
+            project_id, ep_number, title, hook_0_3s, ending_cta, next_ep_hook,
+            script_text, continuity_summary, bgm_prompt, bgm_file_path, bgm_volume,
+            status, vo_mode, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?)
+        """,
+        (
+            project_id,
+            SEED_DEMO_EPISODE["ep_number"],
+            SEED_DEMO_EPISODE["title"],
+            SEED_DEMO_EPISODE["hook_0_3s"],
+            SEED_DEMO_EPISODE["ending_cta"],
+            SEED_DEMO_EPISODE["next_ep_hook"],
+            SEED_DEMO_EPISODE["script_text"],
+            SEED_DEMO_EPISODE["continuity_summary"],
+            SEED_DEMO_EPISODE["bgm_prompt"],
+            SEED_DEMO_EPISODE["bgm_volume"],
+            SEED_DEMO_EPISODE["status"],
+            SEED_DEMO_EPISODE["vo_mode"],
+            ts,
+            ts,
+        ),
+    )
+    episode_id = int(ep_cur.lastrowid)
+
+    for idx, s in enumerate(SEED_DEMO_SHOTS, start=1):
+        ref_ids = [tag_to_id[t] for t in s["ref_tags"] if t in tag_to_id]
+        conn.execute(
+            """
+            INSERT INTO shots (
+                episode_id, shot_no, shot_title, camera_type, duration_sec,
+                flow_mode, ref_asset_ids, cn_action_desc, cn_dialogue, subtitle_text,
+                frame_prompt_en, end_frame_prompt_en, video_prompt_en,
+                audio_strategy, upscale_target, sort_order, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '1080p_free', ?, ?, ?)
+            """,
+            (
+                episode_id,
+                s["shot_no"],
+                s["shot_title"],
+                s["camera_type"],
+                s["duration_sec"],
+                s["flow_mode"],
+                json.dumps(ref_ids, ensure_ascii=False),
+                s["cn_action_desc"],
+                s["cn_dialogue"],
+                s["subtitle_text"],
+                s["frame_prompt_en"],
+                s["end_frame_prompt_en"],
+                s["video_prompt_en"],
+                s["audio_strategy"],
+                idx,
+                ts,
+                ts,
+            ),
+        )
 
 
 def init_db() -> None:
@@ -559,15 +880,24 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS render_jobs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 episode_id INTEGER NOT NULL,
+                shot_id INTEGER,
                 job_type TEXT NOT NULL,
                 target_host TEXT DEFAULT 'local',
                 status TEXT NOT NULL DEFAULT 'pending',
+                progress_pct INTEGER NOT NULL DEFAULT 0,
+                stage_msg TEXT NOT NULL DEFAULT '',
+                provider_task_id TEXT NOT NULL DEFAULT '',
+                cancel_requested INTEGER NOT NULL DEFAULT 0,
                 output_path TEXT DEFAULT '',
+                result_json TEXT NOT NULL DEFAULT '{}',
+                error_msg TEXT NOT NULL DEFAULT '',
                 log_text TEXT DEFAULT '',
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
             );
+
+            CREATE INDEX IF NOT EXISTS idx_render_jobs_episode_status ON render_jobs(episode_id, status, id DESC);
 
             CREATE TABLE IF NOT EXISTS api_usage_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -677,6 +1007,22 @@ def init_db() -> None:
         if "gemini_monthly_credit_usd" not in quota_cols:
             conn.execute("ALTER TABLE quota_state ADD COLUMN gemini_monthly_credit_usd REAL NOT NULL DEFAULT 0.0")
 
+        rj_cols = {r["name"] for r in conn.execute("PRAGMA table_info(render_jobs)").fetchall()}
+        if "shot_id" not in rj_cols:
+            conn.execute("ALTER TABLE render_jobs ADD COLUMN shot_id INTEGER")
+        if "progress_pct" not in rj_cols:
+            conn.execute("ALTER TABLE render_jobs ADD COLUMN progress_pct INTEGER NOT NULL DEFAULT 0")
+        if "stage_msg" not in rj_cols:
+            conn.execute("ALTER TABLE render_jobs ADD COLUMN stage_msg TEXT NOT NULL DEFAULT ''")
+        if "provider_task_id" not in rj_cols:
+            conn.execute("ALTER TABLE render_jobs ADD COLUMN provider_task_id TEXT NOT NULL DEFAULT ''")
+        if "cancel_requested" not in rj_cols:
+            conn.execute("ALTER TABLE render_jobs ADD COLUMN cancel_requested INTEGER NOT NULL DEFAULT 0")
+        if "result_json" not in rj_cols:
+            conn.execute("ALTER TABLE render_jobs ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'")
+        if "error_msg" not in rj_cols:
+            conn.execute("ALTER TABLE render_jobs ADD COLUMN error_msg TEXT NOT NULL DEFAULT ''")
+
         # 初始化单行安全保守额度状态（用户首次选定订阅档位后自动校准写入真实配额）
         cur_month = datetime.now().strftime("%Y-%m")
         ts = now_str()
@@ -693,11 +1039,11 @@ def init_db() -> None:
         # 安全同步默认规则模板（仅插入新键或平滑升级未改写旧版，绝不覆盖用户自定义规则）
         sync_default_prompt_templates(conn, ts=ts)
 
-        # 仅当项目表为空时注入 1 个纯中立演示剧目骨架
+        # 仅当项目表为空时注入 1 个纯中立演示剧目及完整只读示范样例集
         count = conn.execute("SELECT COUNT(*) AS c FROM projects").fetchone()["c"]
         if count == 0:
             for p in SEED_PROJECTS:
-                conn.execute(
+                cur = conn.execute(
                     """
                     INSERT INTO projects (
                         name, slug, track, visual_mode, aspect_ratio, target_duration_sec,
@@ -720,6 +1066,8 @@ def init_db() -> None:
                         ts,
                     ),
                 )
+                if p["slug"] == "demo-companion-drama":
+                    _seed_demo_sample_set(conn, int(cur.lastrowid), ts)
 
         # 幂等按环境变量初始化管理员与协作成员账号（绝不破坏已有数据）
         from .auth import bootstrap_users_from_env

@@ -14,8 +14,10 @@
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -173,7 +175,9 @@ DEFAULTS: dict[str, str] = {
     "DEEPSEEK_API_KEY": "",
     "DEEPSEEK_MODEL": "deepseek-chat",
     "DEFAULT_PROVIDER": "gemini",
-    # 官方 gemini-api CLI 媒体模型与动态单价配置
+    # 媒体生成引擎模式：auto（自动优先官方 google-genai SDK 直连或已安装 CLI）| sdk（强制官方 SDK 直连）| cli（强制 gemini-api CLI）
+    "MEDIA_ENGINE_MODE": "auto",
+    # 官方媒体模型与动态单价配置（同时兼容 google-genai SDK 直连与 gemini-api CLI）
     "CLI_IMAGE_MODEL": "gemini-nano-banana-2.1",
     "CLI_VIDEO_MODEL": "gemini-omni-1.2-flash",
     "CLI_MUSIC_MODEL": "lyria-3.5",
@@ -509,6 +513,11 @@ def update_config(updates: dict[str, Any]) -> dict[str, str]:
                 set_secret(k, sval)
             continue
 
+        if k == "MEDIA_ENGINE_MODE":
+            sval = sval.lower()
+            if sval not in VALID_MEDIA_ENGINE_MODES:
+                sval = "auto"
+
         if set_key is not None:
             set_key(str(ENV_PATH), k, sval)
         else:
@@ -564,6 +573,74 @@ def resolve_dock_drag_dir(cfg: dict[str, str] | None = None) -> Path:
     return Path(c.get("WATCH_DOWNLOADS_DIR") or "~/Downloads").expanduser()
 
 
+VALID_MEDIA_ENGINE_MODES: tuple[str, ...] = ("auto", "sdk", "cli")
+
+
+def get_media_engine_mode(cfg: dict[str, str] | None = None) -> str:
+    """获取规范化后的媒体生成引擎模式：auto / sdk / cli"""
+    c = cfg if cfg is not None else load_config()
+    raw = (c.get("MEDIA_ENGINE_MODE") or "auto").strip().lower()
+    return raw if raw in VALID_MEDIA_ENGINE_MODES else "auto"
+
+
+def is_google_genai_sdk_available() -> bool:
+    """探测当前 Python 运行环境是否已安装官方 google-genai SDK（不触发重型导入副作用）"""
+    if "google.genai" in sys.modules and sys.modules["google.genai"] is not None:
+        return True
+    try:
+        return importlib.util.find_spec("google.genai") is not None
+    except Exception:
+        return False
+
+
+def _is_executable_file(p: Path) -> bool:
+    if not p.exists() or not p.is_file():
+        return False
+    if sys.platform == "win32":
+        return True
+    return os.access(p, os.X_OK)
+
+
+def find_gemini_cli_bin() -> str | None:
+    """跨平台探测官方 gemini-api CLI 可执行文件路径，未安装时返回 None（不抛异常）"""
+    if sys.platform == "win32":
+        for name in ("gemini-api.exe", "gemini-api.cmd", "gemini-api.bat", "gemini-api"):
+            found = shutil.which(name)
+            if found:
+                return found
+        home = Path.home()
+        local_app = Path(os.environ.get("LOCALAPPDATA") or str(home / "AppData" / "Local"))
+        win_candidates = [
+            home / ".local" / "bin" / "gemini-api.exe",
+            home / ".local" / "bin" / "gemini-api.cmd",
+            local_app / "Programs" / "gemini-api" / "gemini-api.exe",
+            local_app / "bin" / "gemini-api.exe",
+            home / "go" / "bin" / "gemini-api.exe",
+        ]
+        for p in win_candidates:
+            if _is_executable_file(p):
+                return str(p)
+        return None
+
+    candidates = [
+        Path.home() / ".local" / "bin" / "gemini-api",
+        Path("/usr/local/bin/gemini-api"),
+        Path("/opt/homebrew/bin/gemini-api"),
+    ]
+    for p in candidates:
+        if _is_executable_file(p):
+            return str(p)
+    return shutil.which("gemini-api")
+
+
+def is_gemini_cli_available() -> bool:
+    """探测本机是否已安装官方 gemini-api CLI（供 /api/health 与前端设置页共用）"""
+    try:
+        return find_gemini_cli_bin() is not None
+    except Exception:
+        return False
+
+
 def _parse_bool(val: str | None, default: bool = False) -> bool:
     if val is None or val == "":
         return default
@@ -615,6 +692,9 @@ def get_public_config() -> dict[str, Any]:
         "deepseek_key_masked": mask_key(cfg["DEEPSEEK_API_KEY"]),
         "deepseek_model": cfg["DEEPSEEK_MODEL"],
         "default_provider": "deepseek" if (ds_enabled and cfg["DEFAULT_PROVIDER"] == "deepseek") else "gemini",
+        "media_engine_mode": get_media_engine_mode(cfg),
+        "google_genai_sdk_ok": is_google_genai_sdk_available(),
+        "gemini_cli_ok": is_gemini_cli_available(),
         "cli_image_model": cfg.get("CLI_IMAGE_MODEL", DEFAULTS["CLI_IMAGE_MODEL"]),
         "cli_video_model": cfg.get("CLI_VIDEO_MODEL", DEFAULTS["CLI_VIDEO_MODEL"]),
         "cli_music_model": cfg.get("CLI_MUSIC_MODEL", DEFAULTS["CLI_MUSIC_MODEL"]),

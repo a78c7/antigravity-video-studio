@@ -18,6 +18,7 @@ import functools
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,30 @@ from typing import Any
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
 from .config import EXPORTS_DIR, MEDIA_DIR
+
+
+def _missing_ffmpeg_guide(missing_tools: list[str]) -> str:
+    tools_str = " / ".join(missing_tools)
+    return (
+        f"未检测到本机 {tools_str}（请先安装 FFmpeg 并确保已加入系统 PATH 后重启服务）：\n"
+        "- macOS：brew install ffmpeg\n"
+        "- Windows：winget install Gyan.FFmpeg（或 choco install ffmpeg）\n"
+        "- Ubuntu/Debian：sudo apt update && sudo apt install -y ffmpeg"
+    )
+
+
+def _ensure_ffmpeg_tools(*, require_ffmpeg: bool = True, require_ffprobe: bool = True) -> tuple[str, str]:
+    """检查本机 ffmpeg / ffprobe 是否可用，缺失时抛出清晰的跨平台中文安装指引"""
+    ffmpeg_bin = shutil.which("ffmpeg") or ""
+    ffprobe_bin = shutil.which("ffprobe") or ""
+    missing: list[str] = []
+    if require_ffmpeg and not ffmpeg_bin:
+        missing.append("ffmpeg")
+    if require_ffprobe and not ffprobe_bin:
+        missing.append("ffprobe")
+    if missing:
+        raise RuntimeError(_missing_ffmpeg_guide(missing))
+    return ffmpeg_bin, ffprobe_bin
 
 
 def _resolution_label(width: int, height: int) -> str:
@@ -41,6 +66,48 @@ def _resolution_label(width: int, height: int) -> str:
     if short_side >= 340:
         return "360p"
     return f"{width}x{height}" if width and height else ""
+
+
+@functools.lru_cache(maxsize=4)
+def _select_filter_complex_file_flag() -> str:
+    """
+    跨 FFmpeg 版本探测从文件加载 filter_complex 的标准参数（彻底规避 Windows 32KB 命令行上限）：
+    - FFmpeg 4/5/6/7：支持 `-filter_complex_script <file>`；
+    - FFmpeg 7/8/9+：官方移除 `-filter_complex_script`，改为通用文件参数前缀 `-/filter_complex <file>`；
+    - 若均不可用则返回空字符串以回退内联 `-filter_complex`。
+    """
+    with tempfile.TemporaryDirectory(prefix="agvs_ff_probe_") as td:
+        fp = Path(td) / "probe_fc.txt"
+        fp.write_text("[0:v]null[vout]", encoding="utf-8")
+        for flag in ("-filter_complex_script", "-/filter_complex"):
+            try:
+                res = subprocess.run(
+                    [
+                        "ffmpeg",
+                        "-y",
+                        "-v",
+                        "error",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        "color=c=black:s=64x64:d=0.05:r=24",
+                        flag,
+                        str(fp),
+                        "-map",
+                        "[vout]",
+                        "-f",
+                        "null",
+                        "-",
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=8.0,
+                )
+                if res.returncode == 0:
+                    return flag
+            except Exception:
+                continue
+    return ""
 
 
 @functools.lru_cache(maxsize=16)
@@ -395,7 +462,7 @@ def probe_media(path: Path) -> dict[str, Any]:
         return {
             "width": w,
             "height": h,
-            "duration_sec": round(dur, 2),
+            "duration_sec": round(dur, 3),
             "resolution_label": _resolution_label(w, h),
             "has_audio": has_a,
         }
@@ -403,8 +470,50 @@ def probe_media(path: Path) -> dict[str, Any]:
         return {"width": 0, "height": 0, "duration_sec": 0.0, "resolution_label": "", "has_audio": False}
 
 
+def _probe_av_durations(path: Path) -> dict[str, float]:
+    """使用 ffprobe 分别读取成片的视频流时长、音频流时长及音画时长差（秒）"""
+    if not path.exists():
+        return {"video_duration_sec": 0.0, "audio_duration_sec": 0.0, "av_drift_sec": 0.0}
+    cmd = [
+        "ffprobe",
+        "-v",
+        "quiet",
+        "-print_format",
+        "json",
+        "-show_format",
+        "-show_streams",
+        str(path),
+    ]
+    try:
+        out = subprocess.check_output(cmd, timeout=8.0)
+        info = json.loads(out.decode("utf-8", errors="ignore"))
+        fmt_dur = float((info.get("format") or {}).get("duration") or 0.0)
+        v_dur = 0.0
+        a_dur = 0.0
+        for st in info.get("streams") or []:
+            ctype = st.get("codec_type")
+            st_dur = float(st.get("duration") or 0.0)
+            if ctype == "video" and v_dur == 0.0:
+                v_dur = st_dur or fmt_dur
+            elif ctype == "audio" and a_dur == 0.0:
+                a_dur = st_dur or fmt_dur
+        if v_dur <= 0.0:
+            v_dur = fmt_dur
+        if a_dur <= 0.0:
+            a_dur = fmt_dur
+        drift = round(abs(v_dur - a_dur), 3)
+        return {
+            "video_duration_sec": round(v_dur, 3),
+            "audio_duration_sec": round(a_dur, 3),
+            "av_drift_sec": drift,
+        }
+    except Exception:
+        return {"video_duration_sec": 0.0, "audio_duration_sec": 0.0, "av_drift_sec": 0.0}
+
+
 def extract_last_frame(video_path: Path, output_png: Path) -> Path:
     """从视频末尾抽取清晰末帧 PNG，用作下一镜首帧参考防画面跳变"""
+    _ensure_ffmpeg_tools(require_ffmpeg=True, require_ffprobe=False)
     if not video_path.exists():
         raise FileNotFoundError(f"视频文件不存在: {video_path}")
     output_png.parent.mkdir(parents=True, exist_ok=True)
@@ -607,19 +716,160 @@ def resolve_shot_clip_duration(shot: dict[str, Any], final_take: dict[str, Any] 
     return round(max(0.5, base_dur), 2)
 
 
-def export_srt(timeline_items: list[dict[str, Any]], output_srt: Path) -> Path:
-    """生成标准 UTF-8 .srt 字幕文件"""
-    output_srt.parent.mkdir(parents=True, exist_ok=True)
-    lines: list[str] = []
+def normalize_vo_sync_mode(vo_sync_mode: str | None) -> str:
+    """规范化 VO 与镜头时长对齐模式：'pad'（尾帧定格延展，默认）或 'speed'（≤1.2x 微加速 + 兜底定格）"""
+    mode = str(vo_sync_mode or "pad").strip().lower()
+    return "speed" if mode == "speed" else "pad"
+
+
+def _resolve_item_vo_duration(item: dict[str, Any]) -> tuple[Path | None, float]:
+    """解析镜头关联 VO 音频路径与真实时长（存在物理文件优先用 ffprobe 探测，否则回退显式 vo_duration_sec）"""
+    p_str = str(item.get("vo_file_path") or "").strip()
+    vo_path: Path | None = None
+    vo_dur = 0.0
+    if p_str:
+        cand = Path(p_str)
+        if cand.exists() and cand.is_file():
+            vo_path = cand.resolve()
+            meta = probe_media(vo_path)
+            vo_dur = float(meta.get("duration_sec") or 0.0)
+    if vo_dur <= 0.0 and item.get("vo_duration_sec"):
+        try:
+            vo_dur = max(0.0, float(item["vo_duration_sec"]))
+        except (TypeError, ValueError):
+            vo_dur = 0.0
+    return vo_path, round(vo_dur, 3)
+
+
+def plan_timeline_with_vo_sync(
+    timeline_items: list[dict[str, Any]],
+    *,
+    vo_sync_mode: str = "pad",
+    vo_offset_sec: float = 0.10,
+) -> dict[str, Any]:
+    """
+    统一计算全集每个镜头与 VO 旁白对齐后的精准时间轴（供 build_master_base_mp4、export_srt、export_fcpxml 同源复用）：
+    - 'pad' 模式：当 vo_dur > base_dur - 0.15 时，计算 pad_sec = round(vo_dur + 0.20 - base_dur, 3) 丝滑定格尾帧，
+      将本镜有效时长延展至 eff_dur = base_dur + pad_sec，并同步顺延后续镜头时间轴 cursor；
+    - 'speed' 模式：当 vo_dur / (base_dur - 0.15) <= 1.20 时用 atempo 微加速人声贴合原镜；
+      超过 1.20x 则限速 atempo=1.20 并对剩余差额做尾帧 tpad 兜底，绝不变花栗鼠也不截断尾音；
+    - 每条 VO 均计算严格截断上限 vo_max_len，确保人声绝对锁定在本镜窗口内，杜绝跨镜叠音打架。
+    """
+    mode = normalize_vo_sync_mode(vo_sync_mode)
+    planned: list[dict[str, Any]] = []
+    adjustments: list[dict[str, Any]] = []
     cursor = 0.0
+
+    for idx, item in enumerate(timeline_items):
+        base_dur = round(max(0.5, float(item.get("effective_duration") or item.get("duration") or 6.0)), 3)
+        vo_path, vo_dur = _resolve_item_vo_duration(item)
+        has_vo = vo_dur > 0.0 and (vo_path is not None or bool(item.get("vo_duration_sec")))
+
+        pad_sec = 0.0
+        vo_tempo = 1.0
+        eff_dur = base_dur
+
+        if has_vo and vo_dur > base_dur - 0.15:
+            if mode == "speed":
+                avail = max(0.25, base_dur - 0.15)
+                ratio = vo_dur / avail
+                if ratio <= 1.20:
+                    vo_tempo = round(max(1.0, ratio), 4)
+                    pad_sec = 0.0
+                    eff_dur = base_dur
+                else:
+                    vo_tempo = 1.20
+                    scaled_vo = vo_dur / vo_tempo
+                    pad_sec = round(max(0.0, scaled_vo + 0.20 - base_dur), 3)
+                    eff_dur = round(base_dur + pad_sec, 3)
+            else:
+                pad_sec = round(max(0.0, vo_dur + 0.20 - base_dur), 3)
+                eff_dur = round(base_dur + pad_sec, 3)
+
+        played_vo_dur = round(vo_dur / vo_tempo, 3) if has_vo else 0.0
+        if has_vo:
+            max_safe_offset = max(0.0, eff_dur - played_vo_dur - 0.04)
+            vo_offset = round(min(vo_offset_sec, max_safe_offset), 3)
+        else:
+            vo_offset = round(min(vo_offset_sec, base_dur * 0.10), 3)
+
+        # 严格限制单镜 VO 音频有效长度在本镜时间窗内（绝不串入下一镜）
+        vo_max_len = round(max(0.1, min(eff_dur - 0.08, eff_dur - vo_offset)), 3)
+
+        # 字幕展示起止时间：有 VO 时优先贴合 min(eff_dur, vo_offset + played_vo_dur + 0.15)
+        if has_vo:
+            sub_start = round(cursor + vo_offset, 3)
+            ideal_sub_end = min(eff_dur, vo_offset + played_vo_dur + 0.15)
+            sub_end = round(cursor + max(min(eff_dur, vo_offset + 0.35), ideal_sub_end), 3)
+        else:
+            sub_start = round(cursor + 0.10, 3)
+            sub_end = round(cursor + max(0.40, eff_dur - 0.10), 3)
+        sub_end = min(round(cursor + eff_dur, 3), max(round(sub_start + 0.20, 3), sub_end))
+
+        entry = {
+            "index": idx,
+            "shot_no": int(item.get("shot_no") or (idx + 1)),
+            "shot_title": item.get("shot_title") or "",
+            "item": item,
+            "cursor_start": round(cursor, 3),
+            "cursor_end": round(cursor + eff_dur, 3),
+            "base_duration": base_dur,
+            "effective_duration": eff_dur,
+            "pad_sec": pad_sec,
+            "has_vo": has_vo,
+            "vo_path": vo_path,
+            "vo_duration_sec": vo_dur,
+            "vo_tempo": vo_tempo,
+            "played_vo_duration_sec": played_vo_dur,
+            "vo_offset_sec": vo_offset,
+            "vo_start_sec": round(cursor + vo_offset, 3),
+            "vo_max_len": vo_max_len,
+            "sub_start_sec": sub_start,
+            "sub_end_sec": sub_end,
+        }
+        planned.append(entry)
+
+        if pad_sec > 0.0 or vo_tempo > 1.001:
+            adjustments.append(
+                {
+                    "shot_no": entry["shot_no"],
+                    "mode": mode,
+                    "base_duration_sec": base_dur,
+                    "vo_duration_sec": vo_dur,
+                    "pad_sec": pad_sec,
+                    "vo_tempo": vo_tempo,
+                    "effective_duration_sec": eff_dur,
+                }
+            )
+        cursor = round(cursor + eff_dur, 3)
+
+    return {
+        "vo_sync_mode": mode,
+        "items": planned,
+        "total_duration_sec": round(cursor, 3),
+        "adjustments": adjustments,
+    }
+
+
+def export_srt(
+    timeline_items: list[dict[str, Any]],
+    output_srt: Path,
+    *,
+    vo_sync_mode: str = "pad",
+) -> Path:
+    """生成标准 UTF-8 .srt 字幕文件（与 VO 对齐时间轴同源一致，有 VO 时紧贴人声结束时间）"""
+    output_srt.parent.mkdir(parents=True, exist_ok=True)
+    plan = plan_timeline_with_vo_sync(timeline_items, vo_sync_mode=vo_sync_mode)
+    lines: list[str] = []
     idx = 1
-    for item in timeline_items:
-        dur = float(item["effective_duration"])
+    for p in plan["items"]:
+        item = p["item"]
         text = (item.get("subtitle_text") or item.get("cn_dialogue") or "").strip()
         if text:
-            lines.append(f"{idx}\n{_fmt_srt_time(cursor + 0.1)} --> {_fmt_srt_time(cursor + max(0.4, dur - 0.1))}\n{text}\n")
+            lines.append(
+                f"{idx}\n{_fmt_srt_time(p['sub_start_sec'])} --> {_fmt_srt_time(p['sub_end_sec'])}\n{text}\n"
+            )
             idx += 1
-        cursor += dur
     output_srt.write_text("\n".join(lines), encoding="utf-8")
     return output_srt
 
@@ -634,17 +884,20 @@ def export_fcpxml(
     episode: dict[str, Any],
     timeline_items: list[dict[str, Any]],
     output_fcpxml: Path,
+    *,
+    vo_sync_mode: str = "pad",
 ) -> Path:
     """
     导出国际标准 FCPXML 1.9 三轨工程（兼容主流非线性剪辑软件原生导入）：
     - 主轨（Spine）：视频 + 每镜原生环境音（仅 mute_for_local_vo 设为静音）；
-    - lane="1"：每镜独立旁白人声 VO 轨（若有 vo_file_path）；
+    - lane="1"：每镜独立旁白人声 VO 轨（若有 vo_file_path，已与对齐后时间轴同步）；
     - lane="-1"：全集完整 BGM 配乐轨。
     """
     output_fcpxml.parent.mkdir(parents=True, exist_ok=True)
     fps = 30
     is_vertical = (project.get("aspect_ratio") or "9:16") == "9:16"
     width, height = (1080, 1920) if is_vertical else (1920, 1080)
+    plan = plan_timeline_with_vo_sync(timeline_items, vo_sync_mode=vo_sync_mode)
 
     fcpxml = ET.Element("fcpxml", version="1.9")
     resources = ET.SubElement(fcpxml, "resources")
@@ -658,13 +911,15 @@ def export_fcpxml(
         height=str(height),
     )
 
-    asset_entries: list[tuple[str, str, int, dict[str, Any]]] = []
+    asset_entries: list[tuple[str, str, int, float, dict[str, Any]]] = []
     total_frames = 0
-    for idx, item in enumerate(timeline_items, start=1):
+    for idx, p in enumerate(plan["items"], start=1):
+        item = p["item"]
+        eff_dur = float(p["effective_duration"])
         clip_path = Path(item["file_path"])
         rid = f"r_clip_{idx}"
-        clip_frames = max(1, int(round(item["effective_duration"] * fps)))
-        src_frames = max(clip_frames, int(round(item["source_duration"] * fps)))
+        clip_frames = max(1, int(round(eff_dur * fps)))
+        src_frames = max(clip_frames, int(round(float(item.get("source_duration") or eff_dur) * fps)))
         ET.SubElement(
             resources,
             "asset",
@@ -680,12 +935,10 @@ def export_fcpxml(
 
         vo_rid = ""
         vo_frames = 0
-        vo_path_str = (item.get("vo_file_path") or "").strip()
-        if vo_path_str and Path(vo_path_str).exists():
-            vo_path = Path(vo_path_str)
-            vo_meta = probe_media(vo_path)
-            vo_dur = float(vo_meta.get("duration_sec") or item["effective_duration"])
-            vo_frames = max(1, int(round(vo_dur * fps)))
+        vo_path = p["vo_path"]
+        if vo_path is not None and vo_path.exists():
+            vo_dur = float(p["vo_duration_sec"] or eff_dur)
+            vo_frames = max(1, int(round(min(vo_dur, eff_dur) * fps)))
             vo_rid = f"r_vo_{idx}"
             ET.SubElement(
                 resources,
@@ -699,7 +952,7 @@ def export_fcpxml(
                 hasAudio="1",
             )
 
-        asset_entries.append((rid, vo_rid, vo_frames, item))
+        asset_entries.append((rid, vo_rid, vo_frames, eff_dur, item))
         total_frames += clip_frames
 
     bgm_rid = ""
@@ -735,8 +988,8 @@ def export_fcpxml(
     spine = ET.SubElement(seq, "spine")
 
     offset_frames = 0
-    for rid, vo_rid, vo_frames, item in asset_entries:
-        dur_frames = max(1, int(round(item["effective_duration"] * fps)))
+    for rid, vo_rid, vo_frames, eff_dur, item in asset_entries:
+        dur_frames = max(1, int(round(eff_dur * fps)))
         start_frames = max(0, int(round(float(item.get("trim_start") or 0.0) * fps)))
         clip_el = ET.SubElement(
             spine,
@@ -794,8 +1047,11 @@ def _resolve_target_dimensions(timeline_items: list[dict[str, Any]]) -> tuple[in
 def _collect_vo_tracks(
     timeline_items: list[dict[str, Any]],
     vo_tracks: list[dict[str, Any]] | None,
+    *,
+    vo_sync_mode: str = "pad",
+    plan: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
-    """统一解析旁白人声轨"""
+    """统一解析旁白人声轨（含精准起播时间、最大时间窗截断长度与可选 atempo 系数）"""
     resolved: list[dict[str, Any]] = []
     if vo_tracks is not None:
         for entry in vo_tracks:
@@ -804,16 +1060,33 @@ def _collect_vo_tracks(
                 continue
             start_sec = float(entry.get("start_sec") if entry.get("start_sec") is not None else (entry.get("offset_sec") or 0.0))
             vol = float(entry.get("volume") if entry.get("volume") is not None else 1.15)
-            resolved.append({"path": Path(p_str).resolve(), "start_sec": max(0.0, start_sec), "volume": vol})
+            max_dur = entry.get("max_duration_sec")
+            tempo = float(entry.get("tempo") or 1.0)
+            resolved.append(
+                {
+                    "path": Path(p_str).resolve(),
+                    "start_sec": max(0.0, start_sec),
+                    "volume": vol,
+                    "max_duration_sec": float(max_dur) if max_dur is not None else None,
+                    "tempo": max(0.5, min(2.0, tempo)),
+                }
+            )
         return resolved
 
-    cursor = 0.0
-    for item in timeline_items:
-        dur = float(item.get("effective_duration") or item.get("duration") or 6.0)
-        p_str = str(item.get("vo_file_path") or "").strip()
-        if p_str and Path(p_str).exists():
-            resolved.append({"path": Path(p_str).resolve(), "start_sec": max(0.0, cursor + 0.12), "volume": 1.15})
-        cursor += dur
+    tl_plan = plan if plan is not None else plan_timeline_with_vo_sync(timeline_items, vo_sync_mode=vo_sync_mode)
+    for p in tl_plan["items"]:
+        vo_path = p.get("vo_path")
+        if vo_path is not None and Path(vo_path).exists():
+            resolved.append(
+                {
+                    "path": Path(vo_path).resolve(),
+                    "start_sec": max(0.0, float(p["vo_start_sec"])),
+                    "volume": 1.15,
+                    "max_duration_sec": float(p["vo_max_len"]),
+                    "tempo": float(p["vo_tempo"]),
+                    "shot_no": p["shot_no"],
+                }
+            )
     return resolved
 
 
@@ -825,22 +1098,29 @@ def build_master_base_mp4(
     vo_tracks: list[dict[str, Any]] | None = None,
     hdr_hlg: bool = False,
     burn_srt_path: Path | None = None,
+    vo_sync_mode: str = "pad",
 ) -> dict[str, Any]:
     """
     跨平台真 1080p 三轨混音母带封装（自动适配 VideoToolbox / NVENC / libx265 / libx264）：
     - 画幅：保持真 1080p（竖屏 1080x1920 / 横屏 1920x1080，30fps）；
+    - VO 音画精准对齐（vo_sync_mode='pad' 尾帧定格延展 | 'speed' ≤1.2x 微加速 + 兜底定格）并严防跨镜叠音；
     - 三轨混音：轨 1 原生环境音 + 轨 2 旁白 VO + 轨 3 BGM（有 VO 时自动 sidechaincompress 闪避 + 片尾 2s 淡出 + alimiter=0.95）；
-    - 安全区字幕：传入 burn_srt_path 时，使用 Pillow 渲染抗锯齿中文字幕透明层并 overlay 至黄金安全区。
+    - 安全区字幕：传入 burn_srt_path 时，使用 Pillow 渲染抗锯齿中文字幕透明层并 overlay 至黄金安全区；
+    - 防 Windows 32KB 命令行溢出：filter_complex 统一落盘临时脚本文件，通过 `-filter_complex_script` 传给 FFmpeg。
     """
     if not timeline_items:
         raise ValueError("当前剧集还没有定稿视频镜头，无法封装母带。")
+
+    _ensure_ffmpeg_tools(require_ffmpeg=True, require_ffprobe=True)
 
     output_mp4 = Path(output_mp4)
     output_mp4.parent.mkdir(parents=True, exist_ok=True)
     out_w, out_h = _resolve_target_dimensions(timeline_items)
     fps = 30
 
-    resolved_vos = _collect_vo_tracks(timeline_items, vo_tracks)
+    norm_sync_mode = normalize_vo_sync_mode(vo_sync_mode)
+    plan = plan_timeline_with_vo_sync(timeline_items, vo_sync_mode=norm_sync_mode)
+    resolved_vos = _collect_vo_tracks(timeline_items, vo_tracks, vo_sync_mode=norm_sync_mode, plan=plan)
     has_vo = len(resolved_vos) > 0
     has_bgm = bool(bgm_file_path and Path(bgm_file_path).exists())
     bgm_vol = max(0.0, min(2.0, float(bgm_volume if bgm_volume is not None else 0.25)))
@@ -858,41 +1138,48 @@ def build_master_base_mp4(
         kept_sfx_count = 0
         muted_or_silent_count = 0
 
-        for idx, item in enumerate(timeline_items):
+        for idx, planned_item in enumerate(plan["items"]):
+            item = planned_item["item"]
             clip_path = Path(item["file_path"]).resolve()
             if not clip_path.exists():
                 raise FileNotFoundError(f"镜头视频文件不存在：{clip_path}")
             ts = max(0.0, float(item.get("trim_start") or 0.0))
-            dur = max(0.5, float(item.get("effective_duration") or item.get("duration") or 6.0))
-            total_dur += dur
+            base_dur = float(planned_item["base_duration"])
+            eff_dur = float(planned_item["effective_duration"])
+            pad_sec = float(planned_item["pad_sec"])
+            total_dur = round(total_dur + eff_dur, 3)
 
             if ts > 0:
                 inputs.extend(["-ss", f"{ts:.3f}"])
-            inputs.extend(["-t", f"{dur:.3f}", "-i", str(clip_path)])
+            inputs.extend(["-t", f"{base_dur:.3f}", "-i", str(clip_path)])
 
-            filters.append(
+            v_chain = (
                 f"[{idx}:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
                 f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,"
-                f"fps={fps},trim=0:{dur:.3f},setpts=PTS-STARTPTS,format=yuv420p[v{idx}]"
+                f"fps={fps},trim=0:{base_dur:.3f},setpts=PTS-STARTPTS"
             )
+            if pad_sec > 0.001:
+                v_chain += f",tpad=stop_mode=clone:stop_duration={pad_sec:.3f},trim=0:{eff_dur:.3f},setpts=PTS-STARTPTS"
+            v_chain += f",format=yuv420p[v{idx}]"
+            filters.append(v_chain)
 
             mute = item.get("audio_strategy") == "mute_for_local_vo"
             if not mute and has_audio_stream(clip_path):
                 filters.append(
                     f"[{idx}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                    f"apad=whole_dur={dur:.3f},atrim=0:{dur:.3f},asetpts=PTS-STARTPTS[a{idx}]"
+                    f"atrim=0:{base_dur:.3f},apad=whole_dur={eff_dur:.3f},atrim=0:{eff_dur:.3f},asetpts=PTS-STARTPTS[a{idx}]"
                 )
                 kept_sfx_count += 1
             else:
                 filters.append(
-                    f"anullsrc=r=48000:cl=stereo,atrim=0:{dur:.3f},asetpts=PTS-STARTPTS[a{idx}]"
+                    f"anullsrc=r=48000:cl=stereo,atrim=0:{eff_dur:.3f},asetpts=PTS-STARTPTS[a{idx}]"
                 )
                 muted_or_silent_count += 1
 
             concat_pairs.append(f"[v{idx}][a{idx}]")
 
-        next_input_idx = len(timeline_items)
-        filters.append(f"{''.join(concat_pairs)}concat=n={len(timeline_items)}:v=1:a=1[vcat][sfx_raw]")
+        next_input_idx = len(plan["items"])
+        filters.append(f"{''.join(concat_pairs)}concat=n={len(plan['items'])}:v=1:a=1[vcat][sfx_raw]")
         v_cur = "[vcat]"
 
         # 烧录黄金安全区中文字幕
@@ -933,7 +1220,7 @@ def build_master_base_mp4(
             )
             v_cur = "[vout]"
 
-        # 轨 2 旁白人声 VO 汇聚
+        # 轨 2 旁白人声 VO 汇聚（按镜头窗口严格 atrim 防止跨镜叠音，支持 speed 模式微加速 atempo）
         if has_vo:
             vo_labels: list[str] = []
             for k, vo in enumerate(resolved_vos):
@@ -942,19 +1229,45 @@ def build_master_base_mp4(
                 next_input_idx += 1
                 delay_ms = int(round(vo["start_sec"] * 1000))
                 vo_vol = max(0.1, min(3.0, float(vo["volume"])))
-                filters.append(
-                    f"[{vo_in}:a]aresample=48000,aformat=sample_fmts=fltp:channel_layouts=stereo,"
-                    f"highpass=f=80,volume={vo_vol:.2f},adelay={delay_ms}|{delay_ms},"
-                    f"apad=whole_dur={total_dur:.3f},atrim=0:{total_dur:.3f},asetpts=PTS-STARTPTS[vo{k}]"
+                vo_tempo = float(vo.get("tempo") or 1.0)
+                vo_max_len = vo.get("max_duration_sec")
+
+                vo_chain_parts = [
+                    f"[{vo_in}:a]aresample=48000",
+                    "aformat=sample_fmts=fltp:channel_layouts=stereo",
+                    "highpass=f=80",
+                ]
+                if vo_tempo > 1.001 or vo_tempo < 0.999:
+                    vo_chain_parts.append(f"atempo={vo_tempo:.4f}")
+                if vo_max_len is not None and float(vo_max_len) > 0:
+                    vo_chain_parts.append(f"atrim=0:{max(0.1, float(vo_max_len)):.3f}")
+                    vo_chain_parts.append("asetpts=PTS-STARTPTS")
+                vo_chain_parts.extend(
+                    [
+                        f"volume={vo_vol:.2f}",
+                        f"adelay={delay_ms}|{delay_ms}",
+                        f"apad=whole_dur={total_dur:.3f}",
+                        f"atrim=0:{total_dur:.3f}",
+                        f"asetpts=PTS-STARTPTS[vo{k}]",
+                    ]
                 )
+                filters.append(",".join(vo_chain_parts))
                 vo_labels.append(f"[vo{k}]")
             if len(vo_labels) == 1:
-                filters.append(f"{vo_labels[0]}asplit=2[vo_mix][vo_sc]")
+                if has_bgm:
+                    filters.append(f"{vo_labels[0]}asplit=2[vo_mix][vo_sc]")
+                else:
+                    filters.append(f"{vo_labels[0]}anull[vo_mix]")
             else:
-                filters.append(
-                    f"{''.join(vo_labels)}amix=inputs={len(vo_labels)}:duration=first:normalize=0,"
-                    f"asplit=2[vo_mix][vo_sc]"
-                )
+                if has_bgm:
+                    filters.append(
+                        f"{''.join(vo_labels)}amix=inputs={len(vo_labels)}:duration=first:normalize=0,"
+                        f"asplit=2[vo_mix][vo_sc]"
+                    )
+                else:
+                    filters.append(
+                        f"{''.join(vo_labels)}amix=inputs={len(vo_labels)}:duration=first:normalize=0[vo_mix]"
+                    )
 
         # 轨 3 BGM（循环对齐 + 片尾 2 秒自然淡出 + 有 VO 时 sidechaincompress 闪避）
         if has_bgm:
@@ -994,14 +1307,20 @@ def build_master_base_mp4(
         else:
             filters.append("[sfx_raw]alimiter=limit=0.95[aout]")
 
+        # 统一写入 filter_complex 脚本文件，彻底规避 Windows 32KB 命令行长度上限（兼容 FFmpeg 4–7 `-filter_complex_script` 与 FFmpeg 8/9+ `-/filter_complex`）
+        filter_graph_text = ";\n".join(filters)
+        filter_script_path = tmp_dir / "filter_complex.txt"
+        filter_script_path.write_text(filter_graph_text, encoding="utf-8")
+        fc_file_flag = _select_filter_complex_file_flag()
+        fc_args = [fc_file_flag, str(filter_script_path)] if fc_file_flag else ["-filter_complex", filter_graph_text]
+
         cmd = [
             "ffmpeg",
             "-y",
             "-v",
             "error",
             *inputs,
-            "-filter_complex",
-            ";".join(filters),
+            *fc_args,
             "-map",
             v_cur,
             "-map",
@@ -1024,13 +1343,18 @@ def build_master_base_mp4(
         if res.returncode != 0 or not output_mp4.exists():
             raise RuntimeError(f"母带封装失败（{encoder_name}）：{res.stderr[-500:]}")
 
+    av_probe = _probe_av_durations(output_mp4)
+    adjustments = plan["adjustments"]
     hdr_tag = "10-bit HEVC BT.2020 HLG HDR" if hdr_hlg else "BT.709 SDR"
     audio_parts = [f"原生环境音({kept_sfx_count}镜)"]
     if has_vo:
-        audio_parts.append(f"旁白VO({len(resolved_vos)}条)")
+        sync_label = "尾帧定格对齐" if norm_sync_mode == "pad" else "人声微加速+兜底定格"
+        adj_note = f"/{len(adjustments)}镜自动延展或变速" if adjustments else ""
+        audio_parts.append(f"旁白VO({len(resolved_vos)}条·{sync_label}{adj_note})")
     if has_bgm:
         audio_parts.append(f"BGM(vol={bgm_vol:.2f}" + ("+侧链闪避" if has_vo else "") + "+片尾2s淡出)")
     sub_note = " + 黄金安全区中文字幕" if burned_subtitles else ""
+    drift_note = f" · 音画差 {av_probe['av_drift_sec']:.3f}s"
     return {
         "mode": "local_hdr_hlg" if hdr_hlg else "local_master_1080p",
         "encoder": encoder_name,
@@ -1041,13 +1365,18 @@ def build_master_base_mp4(
         "hdr_hlg": bool(hdr_hlg),
         "has_bgm": has_bgm,
         "vo_count": len(resolved_vos),
+        "vo_sync_mode": norm_sync_mode,
+        "vo_sync_adjustments": adjustments,
         "kept_sfx_shots": kept_sfx_count,
         "muted_shots": muted_or_silent_count,
         "burned_subtitles": burned_subtitles,
         "total_duration_sec": round(total_dur, 2),
+        "video_duration_sec": av_probe["video_duration_sec"],
+        "audio_duration_sec": av_probe["audio_duration_sec"],
+        "av_drift_sec": av_probe["av_drift_sec"],
         "log": (
             f"本地 {encoder_name} 封装完成：{out_w}x{out_h}@{fps}fps · {hdr_tag} · "
-            f"三轨混音[{' + '.join(audio_parts)}]{sub_note}"
+            f"三轨混音[{' + '.join(audio_parts)}]{sub_note}{drift_note}"
         ),
     }
 
@@ -1060,6 +1389,7 @@ def build_local_preview_mp4(
     vo_tracks: list[dict[str, Any]] | None = None,
     hdr_hlg: bool = False,
     burn_srt_path: Path | None = None,
+    vo_sync_mode: str = "pad",
 ) -> dict[str, Any]:
     """向后兼容的本地拼片入口：输出真 1080p + 三轨音频（原生环境音 + 旁白 VO + 闪避 BGM）"""
     return build_master_base_mp4(
@@ -1070,6 +1400,7 @@ def build_local_preview_mp4(
         vo_tracks=vo_tracks,
         hdr_hlg=hdr_hlg,
         burn_srt_path=burn_srt_path,
+        vo_sync_mode=vo_sync_mode,
     )
 
 

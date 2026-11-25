@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { api, roleLabel, UNAUTHORIZED_EVENT } from './api';
 import type { CloudSection } from './components/CloudWorkspaceView';
+import { EnvHealthBanner } from './components/EnvHealthBanner';
 import { LoginPage } from './components/LoginPage';
 import { AnalyticsPage } from './pages/AnalyticsPage';
 import { CollabInboxPage, type JumpSection } from './pages/CollabInboxPage';
@@ -25,6 +26,7 @@ import type {
   AppMode,
   AuthMeResponse,
   AuthUser,
+  HealthStatus,
   InboxItem,
   InboxState,
   Project,
@@ -57,6 +59,8 @@ export function App() {
 
   // 仅 local_producer 模式使用的状态
   const [settings, setSettings] = useState<PublicSettings | null>(null);
+  const [health, setHealth] = useState<HealthStatus | null>(null);
+  const [refreshingHealth, setRefreshingHealth] = useState(false);
   const [inbox, setInbox] = useState<InboxState>({ status: 'stopped', watch_dir: '~/Downloads', error: '', items: [] });
   const [inboxOpen, setInboxOpen] = useState(false);
   const [keepChineseCopy, setKeepChineseCopy] = useState(true);
@@ -102,6 +106,25 @@ export function App() {
     }
     if (typeof res.settings?.keep_chinese_copy_on_claim === 'boolean') {
       setKeepChineseCopy(res.settings.keep_chinese_copy_on_claim);
+    }
+  };
+
+  const loadHealth = async (manual = false) => {
+    if (manual) setRefreshingHealth(true);
+    try {
+      const res = await api.get<HealthStatus>('/api/health');
+      setHealth(res);
+      if (manual) {
+        notify(
+          res.ffmpeg_ok === false || res.ffprobe_ok === false
+            ? '环境体检完成：尚未检测到 FFmpeg，请按上方指引安装'
+            : '环境体检完成：核心运行环境状态已刷新'
+        );
+      }
+    } catch {
+      // 忽略偶发探测失败
+    } finally {
+      if (manual) setRefreshingHealth(false);
     }
   };
 
@@ -206,6 +229,7 @@ export function App() {
 
     if (!isCloud) {
       loadSettings().catch(() => {});
+      loadHealth(false).catch(() => {});
       loadInbox();
       const timer = setInterval(loadInbox, 5000);
       return () => clearInterval(timer);
@@ -596,6 +620,28 @@ export function App() {
 
       {/* 主内容区（移动端留出底部导航高度防遮挡） */}
       <main className="flex-1 min-w-0 p-3.5 sm:p-5 md:p-6 pb-24 md:pb-6 overflow-x-hidden">
+        {!isCloud && (
+          <EnvHealthBanner
+            health={health}
+            settings={settings}
+            projects={projects}
+            refreshingHealth={refreshingHealth}
+            onRefreshHealth={() => loadHealth(true)}
+            onOpenSettings={() => {
+              setActiveProject(null);
+              setTab('settings');
+            }}
+            onOpenDemoProject={(demoProj) => {
+              setPendingEpId(null);
+              setPendingCloudSection('review');
+              setPendingOpenRevisions(false);
+              setActiveProject(demoProj);
+              setTab('projects');
+            }}
+            notify={notify}
+          />
+        )}
+
         {isCloud && tab === 'collab_inbox' && (
           <CollabInboxPage
             user={user}
@@ -673,7 +719,14 @@ export function App() {
 
         {!isCloud && tab === 'settings' && (
           <Suspense fallback={<div className="py-12 text-center text-xs text-slate-400">正在加载本机设置...</div>}>
-            <SettingsPage settings={settings} onSettingsUpdated={loadSettings} notify={notify} />
+            <SettingsPage
+              settings={settings}
+              onSettingsUpdated={async () => {
+                await loadSettings();
+                await loadHealth(false);
+              }}
+              notify={notify}
+            />
           </Suspense>
         )}
       </main>

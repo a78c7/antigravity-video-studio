@@ -32,19 +32,24 @@ from .net import make_cn_sync_client, make_google_sync_client
 
 
 def estimate_text_cost_usd(provider: str, model: str, prompt_tokens: int, completion_tokens: int) -> float:
-    """按官方 Gemini API 参考费率估算单次文本调用成本（USD），用于额度预算预警"""
+    """按官方公开 Gemini API 参考费率估算单次文本调用成本（USD / 百万 Token），用于额度预算预警"""
     if provider != "gemini":
         return 0.0
     m = (model or "").lower()
-    if "carbon" in m:
-        in_rate, out_rate = 5.0, 25.0
-    elif "neon" in m:
-        in_rate, out_rate = 3.0, 15.0
-    elif "hydrogen" in m:
-        in_rate, out_rate = 0.50, 3.0
+    if ("gemini-3" in m or "3." in m or "3-" in m) and "pro" in m:
+        # Gemini 3 Pro 系列公开估算档
+        in_rate, out_rate = 2.00, 12.00
     elif "2.5-pro" in m or "pro" in m:
-        in_rate, out_rate = 1.25, 10.0
+        # Gemini 2.5 Pro 等 Pro 系列公开估算档
+        in_rate, out_rate = 1.25, 10.00
+    elif "flash-lite" in m or "lite" in m:
+        # Flash-Lite 轻量档
+        in_rate, out_rate = 0.10, 0.40
+    elif "gemini-3" in m or "3." in m or "3-" in m:
+        # Gemini 3 Flash 系列公开估算档
+        in_rate, out_rate = 0.50, 3.00
     else:
+        # Gemini 2.5 Flash 及其他默认档
         in_rate, out_rate = 0.30, 2.50
     p = max(0, int(prompt_tokens or 0))
     c = max(0, int(completion_tokens or 0))
@@ -343,15 +348,68 @@ def extract_json(raw: str) -> Any:
 # ==================== 核心业务 AI 能力（全题材通用） ====================
 
 
+def _compose_cached_system_prompt(base_template: str, stable_context: str = "") -> str:
+    """
+    将稳定的系统规则模板与剧目/资产圣经固定在 system_instruction 前缀位置，
+    避免混入逐次变化的动态指令，最大化 Gemini 隐式上下文缓存（Implicit Caching）命中率。
+    """
+    base = (base_template or "").strip()
+    ctx = (stable_context or "").strip()
+    if base and ctx:
+        return f"{base}\n\n{ctx}"
+    return base or ctx
+
+
 def _format_projects_brief(projects: list[dict[str, Any]]) -> str:
     if not projects:
         return "- （当前暂无剧目，请按通用精品 AI 微短剧标准构思）"
+    ordered = sorted(projects, key=lambda p: int(p.get("id") or 0))
     return "\n".join(
         [
             f"- ID={p['id']} 《{p['name']}》（赛道：{p.get('track') or '通用短剧'}）：{p.get('description') or ''}"
-            for p in projects
+            for p in ordered
         ]
     )
+
+
+def _format_project_bible_prefix(
+    project: dict[str, Any],
+    existing_assets: list[dict[str, Any]] | None = None,
+) -> str:
+    """构造字节级稳定的剧目档案与跨集资产圣经前缀（按 ID 排序、确定性序列化）"""
+    lines = [
+        "【固定剧目档案（稳定前缀）】",
+        f"- 剧目名称：《{project.get('name', '')}》",
+        f"- 赛道与视觉路线：{project.get('track', '')} / {project.get('visual_mode', '')} / 画幅 {project.get('aspect_ratio', '9:16')}",
+        f"- 目标时长：约 {project.get('target_duration_sec', 75)} 秒",
+    ]
+    global_style = (project.get("global_style_prompt") or "").strip()
+    if global_style:
+        lines.append(f"- 全局视觉锁词：{global_style}")
+    season_outline = project.get("season_outline", "[]")
+    if season_outline and str(season_outline).strip() not in ("", "[]"):
+        lines.append(f"- 本剧季大纲：{season_outline}")
+    continuity = project.get("continuity_ledger", "{}")
+    if continuity and str(continuity).strip() not in ("", "{}"):
+        lines.append(f"- 跨集连续性台账（严禁吃书）：{continuity}")
+
+    if existing_assets is not None:
+        ordered_assets = sorted(existing_assets, key=lambda a: int(a.get("id") or 0))
+        assets_brief = [
+            {
+                "id": a["id"],
+                "type": a["asset_type"],
+                "name": a["name"],
+                "flow_tag": a["flow_tag"],
+                "en": a["en_anchor_prompt"],
+                **({"guard": a["negative_guard_en"]} if (a.get("negative_guard_en") or "").strip() else {}),
+            }
+            for a in ordered_assets
+        ]
+        lines.append("【跨集资产圣经（优先复用已有资产 ID，严禁违背护盾锁词）】")
+        lines.append(json.dumps(assets_brief, ensure_ascii=False, sort_keys=True))
+
+    return "\n".join(lines)
 
 
 def score_topics_with_ai(
@@ -361,13 +419,13 @@ def score_topics_with_ai(
     provider: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """批量给热点/灵感按「主题契合 + 钩子反转 + 合规体面 + 破圈势能 + AI 可拍性」5 维标准打分"""
-    sys_prompt = get_prompt_template("topic_scorer")
     proj_brief = _format_projects_brief(projects)
-    theme_hint = (theme or "").strip() or "紧密结合上述现有剧目定位与赛道风格"
-    user_prompt = f"""当前工作室的剧目列表：
-{proj_brief}
-
-本次选题目标主题/赛道倾向：{theme_hint}
+    sys_prompt = _compose_cached_system_prompt(
+        get_prompt_template("topic_scorer"),
+        f"【当前工作室剧目列表（稳定上下文）】\n{proj_brief}",
+    )
+    theme_hint = (theme or "").strip() or "紧密结合现有剧目定位与赛道风格"
+    user_prompt = f"""本次选题目标主题/赛道倾向：{theme_hint}
 
 请对以下 {len(candidates)} 个候选热点/灵感逐一评估「能否巧妙嫁接/借壳拍成高质量 AI 微短剧」并给出真实 5 维打分：
 {json.dumps(candidates, ensure_ascii=False, indent=2)}
@@ -427,8 +485,11 @@ def search_topic_ideas(
     provider: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """用 Gemini Google Search Grounding 联网广泛挖掘指定主题/关键词的真实素材，并按 5 维标准打分"""
-    sys_prompt = get_prompt_template("topic_scorer")
     proj_brief = _format_projects_brief(projects)
+    sys_prompt = _compose_cached_system_prompt(
+        get_prompt_template("topic_scorer"),
+        f"【工作室现有剧目（稳定上下文）】\n{proj_brief}",
+    )
     theme_str = (theme or "").strip()
     kw = (focus_keyword or "").strip()
     if not kw and theme_str:
@@ -436,12 +497,10 @@ def search_topic_ideas(
     elif not kw:
         kw = "近期高热度电影感微短剧灵感（覆盖科幻脑洞、萌宠治愈、美食手作、职场生活、人文风物与硬核科普等方向）"
 
-    theme_clause = f"目标赛道/主题定位：{theme_str}" if theme_str else "目标赛道/主题定位：结合下方现有剧目灵活匹配"
+    theme_clause = f"目标赛道/主题定位：{theme_str}" if theme_str else "目标赛道/主题定位：结合现有剧目灵活匹配"
     user_prompt = f"""请联网搜索近期关于「{kw}」的真实新闻、行业进展、生活趣闻、人文细节或视觉热点，挑出 **5 个题材尽量不重复的切口**，分别构思 1 个 60–85 秒电影级 AI 微短剧选题，并用总制片人视角苛刻打分。
 
 {theme_clause}
-工作室现有剧目：
-{proj_brief}
 
 【实战要求】
 1. 搜到的真实信息仅作为「事实底座（写在 summary）」，绝不写成流水账汇报片，必须落到**具体主角（优先 3D 虚拟搭档/动物/器物/机械体/单人动作特写）+ 开局困境冲突 + 中后段反转**。
@@ -494,8 +553,11 @@ def search_benchmarks_with_ai(
     provider: str | None = None,
 ) -> tuple[list[dict[str, Any]], str]:
     """全网爆款结构对标与主题化转译，读取 `benchmark_adapter` 规则模板"""
-    sys_prompt = get_prompt_template("benchmark_adapter")
     proj_brief = _format_projects_brief(projects)
+    sys_prompt = _compose_cached_system_prompt(
+        get_prompt_template("benchmark_adapter"),
+        f"【工作室现有剧目（稳定上下文）】\n{proj_brief}",
+    )
     n = max(3, min(8, int(count or 6)))
     focus_str = (focus or keyword or "").strip() or "近期全网刷屏的电影感 AI 短片、强视觉奇观与高完播微短剧"
     theme_str = (theme or "").strip() or "结合现有剧目定位自由匹配最契合的赛道"
@@ -504,8 +566,6 @@ def search_benchmarks_with_ai(
 
 参考对标方向：{focus_str}
 目标转译主题：{theme_str}
-工作室现有剧目：
-{proj_brief}
 
 要求：
 1. 每条选题明确写清参考的爆款手法（`benchmark_case`）与我方差异化升级点；
@@ -554,14 +614,11 @@ def generate_episode_script_with_ai(
     provider: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     """生成 50-85 秒黄金节奏分集剧本与双尾钩"""
-    sys_prompt = get_prompt_template("script_writer")
-    user_prompt = f"""剧目名称：《{project['name']}》
-赛道与画风：{project['track']} / {project['visual_mode']} / 画幅 {project['aspect_ratio']}
-目标时长：约 {project['target_duration_sec']} 秒
-本剧季大纲：{project.get('season_outline', '[]')}
-跨集连续性台账（严禁吃书）：{project.get('continuity_ledger', '{}')}
-
-本次创作第 {ep_number} 集：
+    sys_prompt = _compose_cached_system_prompt(
+        get_prompt_template("script_writer"),
+        _format_project_bible_prefix(project),
+    )
+    user_prompt = f"""本次创作第 {ep_number} 集：
 选题标题：{topic_title}
 核心卖点：{topic_pitch}
 创作者补充要求：{extra_notes or '无特殊补充，保证前3秒极强视觉冲击、克制高级、规避写实人脸长对话恐怖谷'}
@@ -592,11 +649,9 @@ def critique_and_revise_script_with_ai(
     多角色编辑部审稿返工引擎（编剧初稿 → 毒舌主编挑刺 → 定向改稿出终稿）：
     返回 (终版剧本 dict, 编辑部审稿报告 dict, 使用模型名)。
     """
-    critic_sys = get_prompt_template("script_critic")
-    critic_user = f"""剧目：《{project['name']}》（赛道：{project['track']} / 视觉路线：{project['visual_mode']} / 画幅：{project['aspect_ratio']}）
-目标时长：约 {project['target_duration_sec']} 秒
-跨集连续性台账：{project.get('continuity_ledger', '{}')}
-创作者补充要求：{extra_notes or '无'}
+    project_prefix = _format_project_bible_prefix(project)
+    critic_sys = _compose_cached_system_prompt(get_prompt_template("script_critic"), project_prefix)
+    critic_user = f"""创作者补充要求：{extra_notes or '无'}
 
 以下是编剧交上来的第 {ep_number} 集初稿剧本 JSON：
 {json.dumps(draft_script, ensure_ascii=False, indent=2)}
@@ -619,11 +674,9 @@ def critique_and_revise_script_with_ai(
     critic_raw, used_critic = generate_text(critic_sys, critic_user, provider=provider, expect_json=True, temperature=0.45)
     critique = extract_json(critic_raw)
 
-    writer_sys = get_prompt_template("script_writer")
+    writer_sys = _compose_cached_system_prompt(get_prompt_template("script_writer"), project_prefix)
     revise_user = f"""你是本剧总编剧，现在请严格按照【毒舌审稿主编的必改指令】对第 {ep_number} 集初稿进行定向重写升级！
 
-剧目：《{project['name']}》（{project['track']} / {project['visual_mode']} / {project['aspect_ratio']}，目标 {project['target_duration_sec']} 秒）
-跨集连续性台账：{project.get('continuity_ledger', '{}')}
 创作者补充要求：{extra_notes or '无'}
 
 【初稿剧本】：
@@ -688,18 +741,11 @@ def break_script_to_shots_with_ai(
     provider: str | None = None,
 ) -> tuple[dict[str, Any], str]:
     """自动从剧本提取缺失资产（角色/场景/道具）并拆解为标准分镜表与英文提示词"""
-    sys_prompt = get_prompt_template("shot_breaker")
-    assets_brief = [
-        {"id": a["id"], "type": a["asset_type"], "name": a["name"], "flow_tag": a["flow_tag"], "en": a["en_anchor_prompt"]}
-        for a in existing_assets
-    ]
-    user_prompt = f"""剧目：《{project['name']}》（画幅 {project['aspect_ratio']}，视觉路线：{project['visual_mode']}）
-全局视觉锁词：{project.get('global_style_prompt', '')}
-
-现有跨集资产库（请优先复用已有资产 ID）：
-{json.dumps(assets_brief, ensure_ascii=False)}
-
-本集（第 {episode['ep_number']} 集《{episode['title']}》）完整剧本：
+    sys_prompt = _compose_cached_system_prompt(
+        get_prompt_template("shot_breaker"),
+        _format_project_bible_prefix(project, existing_assets=existing_assets),
+    )
+    user_prompt = f"""本集（第 {episode['ep_number']} 集《{episode['title']}》）完整剧本：
 {episode.get('script_text', '')}
 
 请完成两件事，并严格按以下 JSON 格式返回：

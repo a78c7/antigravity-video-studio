@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export PYTHONUTF8=1
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
@@ -159,9 +161,17 @@ if [ ! -x ".venv/bin/python" ] || [ ! -x ".venv/bin/uvicorn" ]; then
         echo "错误：未检测到 Python 3.12 及以上版本，请先安装 Python 3.12+ 后重试。" >&2
         exit 1
       fi
-      uv venv --python "$PYTHON_BIN" .venv
+      if ! uv venv --python "$PYTHON_BIN" .venv; then
+        echo "错误：uv 创建虚拟环境失败，请删除残损的 .venv 目录后重试。" >&2
+        exit 1
+      fi
     fi
-    uv pip install --python .venv/bin/python "${DEPS[@]}"
+    if ! uv pip install --python .venv/bin/python "${DEPS[@]}"; then
+      echo "错误：uv 安装项目依赖失败。" >&2
+      echo "排查建议：国内网络可设置镜像源后重试：" >&2
+      echo "  UV_DEFAULT_INDEX=https://pypi.tuna.tsinghua.edu.cn/simple ./start.sh" >&2
+      exit 1
+    fi
   else
     PYTHON_BIN="$(find_python312 || true)"
     if [ -z "$PYTHON_BIN" ]; then
@@ -170,14 +180,22 @@ if [ ! -x ".venv/bin/python" ] || [ ! -x ".venv/bin/uvicorn" ]; then
       exit 1
     fi
     "$PYTHON_BIN" -m venv .venv
-    .venv/bin/python -m pip install --upgrade pip
-    .venv/bin/python -m pip install "${DEPS[@]}"
+    .venv/bin/python -m pip install --upgrade pip || echo "提示：升级 pip 未成功，继续安装项目依赖..." >&2
+    if ! .venv/bin/python -m pip install "${DEPS[@]}"; then
+      echo "错误：pip 安装项目依赖失败。" >&2
+      echo "排查建议：国内网络可设置镜像源后重试：" >&2
+      echo "  PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple ./start.sh" >&2
+      exit 1
+    fi
   fi
 fi
 
-if ! command -v ffmpeg >/dev/null 2>&1; then
-  echo "提示：未检测到 ffmpeg，本地视频剪辑、混音与音画体检功能需安装 ffmpeg。"
-  echo "  macOS: brew install ffmpeg   Ubuntu/Debian: sudo apt install ffmpeg"
+if ! command -v ffmpeg >/dev/null 2>&1 || ! command -v ffprobe >/dev/null 2>&1; then
+  echo "提示：未检测到完整的 ffmpeg / ffprobe，本地视频剪辑、三轨混音、音画体检与成片渲染需安装 FFmpeg："
+  echo "  macOS (Homebrew):  brew install ffmpeg"
+  echo "  Ubuntu / Debian:   sudo apt update && sudo apt install -y ffmpeg"
+  echo "  Fedora / RHEL:     sudo dnf install -y ffmpeg"
+  echo "  Arch Linux:        sudo pacman -S ffmpeg"
 fi
 
 echo "启动「反重力视频工坊」本地制片台：${URL}"

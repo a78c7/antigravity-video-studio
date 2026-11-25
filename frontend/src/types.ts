@@ -311,12 +311,112 @@ export interface TimelineItem {
 export interface RenderJob {
   id: number;
   episode_id: number;
+  shot_id?: number | null;
   job_type: string;
   target_host: string;
   status: string;
+  progress_pct?: number;
+  stage_msg?: string;
+  provider_task_id?: string;
+  cancel_requested?: number;
   output_path: string;
   log_text: string;
+  result_json?: string;
+  result?: Record<string, any> | null;
+  error_msg?: string;
   created_at: string;
+  updated_at?: string;
+}
+
+export interface AsyncJob {
+  id: number;
+  episode_id: number;
+  shot_id?: number | null;
+  job_type: string;
+  target_host: string;
+  status: 'pending' | 'running' | 'done' | 'failed' | 'cancelled' | 'interrupted' | string;
+  progress_pct?: number;
+  stage_msg?: string;
+  provider_task_id?: string;
+  cancel_requested?: number;
+  output_path?: string;
+  log_text?: string;
+  result_json?: string;
+  result?: Record<string, any> | null;
+  error_msg?: string;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface HealthStatus {
+  status: string;
+  app?: string;
+  brand_name?: string;
+  app_mode?: AppMode;
+  version?: string;
+  ffmpeg_ok?: boolean;
+  ffprobe_ok?: boolean;
+  google_genai_sdk_ok?: boolean;
+  gemini_cli_ok?: boolean;
+  colab_cli_ok?: boolean;
+  disk_free_gb?: number | null;
+  path_warning?: string;
+}
+
+export interface QcShotReport {
+  video_path?: string;
+  strip_path?: string;
+  width?: number;
+  height?: number;
+  duration_sec?: number;
+  has_audio?: boolean;
+  mean_volume_db?: number | null;
+  max_volume_db?: number | null;
+  voice_band_mean_db?: number | null;
+  voice_band_max_db?: number | null;
+  silence_duration_sec?: number;
+  silence_ratio?: number;
+  frame_lumas?: number[];
+  expect_dialogue?: boolean;
+  status?: 'ok' | 'warn' | string;
+  warnings?: string[];
+  summary?: string;
+}
+
+export interface QcInspectVideoItem {
+  shot_id: number;
+  shot_no: number;
+  shot_title: string;
+  take_id?: number;
+  resolution_label?: string;
+  video_path?: string;
+  qc_strip_path?: string;
+  expect_dialogue?: boolean;
+  has_warning: boolean;
+  warnings: string[];
+  report: QcShotReport;
+}
+
+export interface QcInspectVideosResponse {
+  episode_id: number;
+  resolution_filter: string;
+  inspected_count: number;
+  passed_count: number;
+  warning_count: number;
+  missing_shots: number[];
+  overview_sheet_path: string;
+  shots: QcInspectVideoItem[];
+}
+
+export interface QcFramesSheetResponse {
+  episode_id: number;
+  sheet_path: string;
+  output_path: string;
+  image_count: number;
+  cols: number;
+  title: string;
+  width?: number;
+  height?: number;
 }
 
 export interface PublishLog {
@@ -389,6 +489,9 @@ export interface PublicSettings {
   deepseek_key_masked: string;
   deepseek_model: string;
   default_provider: 'gemini' | 'deepseek';
+  media_engine_mode?: 'auto' | 'sdk' | 'cli' | string;
+  google_genai_sdk_ok?: boolean;
+  gemini_cli_ok?: boolean;
   cli_image_model?: string;
   cli_video_model?: string;
   cli_music_model?: string;

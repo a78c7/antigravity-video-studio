@@ -110,7 +110,8 @@ export const SettingsPage: React.FC<Props> = ({ settings, onSettingsUpdated, not
   const [currentTier, setCurrentTier] = useState('custom');
   const [applyingTier, setApplyingTier] = useState<string | null>(null);
 
-  // 媒体生成模型与单价（可折叠）
+  // 媒体生成引擎模式与模型单价（可折叠）
+  const [mediaEngineMode, setMediaEngineMode] = useState<'auto' | 'sdk' | 'cli'>('auto');
   const [cliSectionOpen, setCliSectionOpen] = useState(false);
   const [cliImageModel, setCliImageModel] = useState('gemini-nano-banana-2.1');
   const [cliVideoModel, setCliVideoModel] = useState('gemini-omni-1.2-flash');
@@ -160,6 +161,11 @@ export const SettingsPage: React.FC<Props> = ({ settings, onSettingsUpdated, not
         if (settings.enable_cloud_collab) setCollabSectionOpen(true);
       }
       setCloudStudioUrl(settings.cloud_studio_url || '');
+      if (settings.media_engine_mode === 'sdk' || settings.media_engine_mode === 'cli' || settings.media_engine_mode === 'auto') {
+        setMediaEngineMode(settings.media_engine_mode);
+      } else {
+        setMediaEngineMode('auto');
+      }
       if (settings.cli_image_model) setCliImageModel(settings.cli_image_model);
       if (settings.cli_video_model) setCliVideoModel(settings.cli_video_model);
       if (settings.cli_music_model) setCliMusicModel(settings.cli_music_model);
@@ -257,6 +263,7 @@ export const SettingsPage: React.FC<Props> = ({ settings, onSettingsUpdated, not
         ENABLE_CLOUD_COLLAB: enableCloudCollab,
         CLOUD_STUDIO_URL: cloudStudioUrl.trim(),
         SYNC_API_TOKEN: syncApiToken.trim() || undefined,
+        MEDIA_ENGINE_MODE: mediaEngineMode,
         CLI_IMAGE_MODEL: cliImageModel.trim(),
         CLI_VIDEO_MODEL: cliVideoModel.trim(),
         CLI_MUSIC_MODEL: cliMusicModel.trim(),
@@ -550,6 +557,54 @@ export const SettingsPage: React.FC<Props> = ({ settings, onSettingsUpdated, not
               </select>
             )}
           </div>
+
+          {/* 媒体生成引擎模式选择（v1.0.1 SDK 直连主通道 + CLI 兼容） */}
+          <div className="pt-3 border-t border-sky-100 space-y-2">
+            <div className="flex flex-wrap items-center justify-between gap-1.5">
+              <label className="text-xs font-semibold text-slate-800">
+                媒体生成引擎模式（MEDIA_ENGINE_MODE）
+              </label>
+              <div className="flex flex-wrap items-center gap-1.5 text-[10px]">
+                <span
+                  className={`rounded-full border px-2 py-0.5 font-medium ${
+                    settings?.google_genai_sdk_ok !== false
+                      ? 'bg-emerald-50 border-emerald-200 text-emerald-700'
+                      : 'bg-amber-50 border-amber-200 text-amber-800'
+                  }`}
+                >
+                  GenAI SDK {settings?.google_genai_sdk_ok !== false ? '已就绪' : '未安装'}
+                </span>
+                <span
+                  className={`rounded-full border px-2 py-0.5 font-medium ${
+                    settings?.gemini_cli_ok
+                      ? 'bg-sky-50 border-sky-200 text-sky-700'
+                      : 'bg-slate-100 border-slate-200 text-slate-500'
+                  }`}
+                >
+                  gemini-api CLI {settings?.gemini_cli_ok ? '已安装' : '可选'}
+                </span>
+              </div>
+            </div>
+            <select
+              value={mediaEngineMode}
+              onChange={(e) => setMediaEngineMode(e.target.value as 'auto' | 'sdk' | 'cli')}
+              className="studio-input w-full rounded-lg px-3 py-2 text-xs"
+            >
+              <option value="auto">auto · 自动优先官方 google-genai SDK 直连（按需回退 CLI · 推荐）</option>
+              <option value="sdk">sdk · 强制官方 google-genai SDK 直连（仅需 GEMINI_API_KEY）</option>
+              <option value="cli">cli · 强制调用本机 gemini-api CLI 通道</option>
+            </select>
+            <div className="rounded-xl border border-sky-200/80 bg-sky-50/70 px-3 py-2 text-[11px] text-slate-700 leading-relaxed space-y-1">
+              <div>
+                <strong className="text-sky-900">开箱即用提示：</strong>
+                填好上方 <code className="font-mono text-sky-800">GEMINI_API_KEY</code> 即可通过内置官方{' '}
+                <code className="font-mono text-sky-800">google-genai</code> SDK 直接生成图片、视频、原创配乐与中文 TTS 旁白，无需额外安装 CLI。
+              </div>
+              <div className="text-slate-600">
+                注：Google AI Pro / Ultra 开发者需先在 Google AI Studio 绑定结算账号（Billing），方可激活每月开发者 API 赠金。
+              </div>
+            </div>
+          </div>
         </div>
 
         {/* 3. DeepSeek 备用引擎 + 本地下载监听目录 */}
@@ -645,7 +700,7 @@ export const SettingsPage: React.FC<Props> = ({ settings, onSettingsUpdated, not
           >
             <div className="space-y-0.5">
               <div className="flex items-center gap-2 text-sm font-semibold text-indigo-900">
-                <Sliders className="h-4 w-4 text-indigo-600" /> 媒体生成模型与估算单价（官方 CLI 动态配置）
+                <Sliders className="h-4 w-4 text-indigo-600" /> 媒体生成模型与估算单价（SDK 直连 / CLI 通用配置）
               </div>
               <div className="text-[11px] text-slate-500 font-mono">
                 图：{cliImageModel} · 视频：{cliVideoModel} · 配乐：{cliMusicModel} · 配音：{cliTtsModel}

@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import inspect
 import json
 import os
 import re
@@ -24,6 +25,7 @@ from ..cli_media import cli_generate_images, cli_generate_music, cli_generate_vi
 from ..config import DATA_DIR, MEDIA_DIR, is_cloud_collab, load_config, resolve_dock_drag_dir, update_config
 from ..db import db_ctx, now_str, rows_to_dicts
 from ..flow_compiler import AUDIO_STRATEGIES, FLOW_MODES, compile_shot_prompts, estimate_episode_credits
+from ..jobs import JobCancelledError, JobContext, submit_job
 from ..llm import (
     break_script_to_shots_with_ai,
     critique_and_revise_script_with_ai,
@@ -990,7 +992,7 @@ def delete_shot(shot_id: int) -> dict[str, Any]:
 
 class ClaimRequest(BaseModel):
     inbox_item_id: str
-    target_type: str  # shot_video | shot_start_frame | shot_end_frame | episode_bgm | asset_clean
+    target_type: str  # shot_video | shot_start_frame | shot_end_frame | episode_bgm | asset_clean | asset_raw
     target_id: int
     keep_chinese_copy: bool | None = None
 
@@ -1335,26 +1337,35 @@ def claim_inbox_media(
             if not row:
                 raise HTTPException(status_code=404, detail="分集不存在")
             dest_dir = MEDIA_DIR / row["slug"] / f"ep{row['ep_number']:02d}"
-            claimed = inbox.claim_file(body.inbox_item_id, dest_dir, f"E{row['ep_number']:02d}_flow_music")
+            try:
+                claimed = inbox.claim_file(body.inbox_item_id, dest_dir, f"E{row['ep_number']:02d}_flow_music")
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc))
             conn.execute("UPDATE episodes SET bgm_file_path = ?, updated_at = ? WHERE id = ?", (claimed["path"], ts, body.target_id))
             return {"claimed": claimed, "inbox": inbox.list_items()}
 
-        if body.target_type == "asset_clean":
+        if body.target_type in ("asset_clean", "asset_raw"):
             row = conn.execute(
                 "SELECT a.*, p.slug FROM assets a JOIN projects p ON a.project_id = p.id WHERE a.id = ?",
                 (body.target_id,),
             ).fetchone()
             if not row:
                 raise HTTPException(status_code=404, detail="资产不存在")
+            is_raw = body.target_type == "asset_raw"
             dest_dir = MEDIA_DIR / row["slug"] / "assets" / f"asset_{body.target_id}"
-            claimed = inbox.claim_file(body.inbox_item_id, dest_dir, "clean_ref")
+            try:
+                claimed = inbox.claim_file(body.inbox_item_id, dest_dir, "raw_ref" if is_raw else "clean_ref")
+            except FileNotFoundError as exc:
+                raise HTTPException(status_code=404, detail=str(exc))
+            col_name = "raw_image_path" if is_raw else "clean_image_path"
             conn.execute(
-                "UPDATE assets SET clean_image_path = ?, updated_at = ? WHERE id = ?",
+                f"UPDATE assets SET {col_name} = ?, updated_at = ? WHERE id = ?",
                 (claimed["path"], ts, body.target_id),
             )
+            updated_asset = dict(conn.execute("SELECT * FROM assets WHERE id = ?", (body.target_id,)).fetchone())
             dock_copy_path = ""
             dock_copy_name = ""
-            if keep_cn_copy:
+            if keep_cn_copy and (not is_raw or not (updated_asset.get("clean_image_path") or "").strip()):
                 try:
                     seq_no = _asset_seq_no(conn, row["project_id"], row["asset_type"], body.target_id)
                     cn_stem = _asset_chinese_copy_stem(row["asset_type"], row["name"], seq_no=seq_no)
@@ -1367,6 +1378,7 @@ def claim_inbox_media(
                 trashed_siblings = inbox.trash_batch_siblings(batch_prefix, exclude_item_id=body.inbox_item_id)
             return {
                 "claimed": claimed,
+                "asset": updated_asset,
                 "dock_copy_path": dock_copy_path,
                 "dock_copy_name": dock_copy_name,
                 "trashed_siblings": trashed_siblings,
@@ -1648,11 +1660,54 @@ def reveal_in_file_manager(body: RevealFinderRequest) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=f"无法打开系统文件管理器：{exc}")
 
 
-# ==================== 官方 gemini-api CLI 一键直出（走 Gemini API 额度） ====================
+# ==================== 官方 SDK / gemini-api CLI 一键直出（走 Gemini API 额度） ====================
+
+
+def _filter_supported_kwargs(fn: Any, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """仅透传目标函数签名支持的可选关键字参数（兼顾回调扩展与测试桩/旧签名）"""
+    try:
+        sig = inspect.signature(fn)
+    except (TypeError, ValueError):
+        return kwargs
+    if any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+        return kwargs
+    return {k: v for k, v in kwargs.items() if k in sig.parameters}
+
+
+def _make_job_progress_cb(ctx: JobContext) -> Any:
+    """将底层媒体生成器的进度回调统一适配到 JobContext.update"""
+
+    def _cb(*args: Any, **kwargs: Any) -> None:
+        pct = kwargs.get("progress_pct", kwargs.get("pct"))
+        msg = kwargs.get("stage_msg", kwargs.get("msg", kwargs.get("message")))
+        log_line = kwargs.get("log_line")
+        provider_task_id = kwargs.get("provider_task_id")
+        if len(args) >= 2:
+            if isinstance(args[0], (int, float)):
+                pct = int(args[0])
+                msg = str(args[1])
+            else:
+                msg = str(args[0])
+                if isinstance(args[1], (int, float)):
+                    pct = int(args[1])
+        elif len(args) == 1:
+            if isinstance(args[0], (int, float)):
+                pct = int(args[0])
+            elif isinstance(args[0], str):
+                msg = args[0]
+        ctx.update(
+            progress_pct=int(pct) if pct is not None else None,
+            stage_msg=str(msg) if msg is not None else None,
+            log_line=str(log_line) if log_line is not None else None,
+            provider_task_id=str(provider_task_id) if provider_task_id is not None else None,
+        )
+
+    return _cb
 
 
 class CliGenerateBgmRequest(BaseModel):
     prompt: str | None = None
+    async_mode: bool = False
 
 
 class CliGenerateAssetCleanRequest(BaseModel):
@@ -1669,6 +1724,7 @@ class CliGenerateFrameRequest(BaseModel):
     slot: str = "start_frame"  # start_frame | end_frame
     image_size: str = "2K"
     count: int = 2
+    async_mode: bool = False
 
 
 class SelectFrameCandidateRequest(BaseModel):
@@ -1680,6 +1736,7 @@ class CliGenerateVideoRequest(BaseModel):
     resolution: str = "360p"  # 360p | 720p | 1080p
     count: int = 1
     duration_sec: int | None = None
+    async_mode: bool = False
 
 
 def _validate_media_candidate(candidate_path: str) -> Path:
@@ -1695,8 +1752,13 @@ def _validate_media_candidate(candidate_path: str) -> Path:
 
 
 @router.post("/episodes/{episode_id}/cli-generate-bgm")
-def cli_generate_episode_bgm(episode_id: int, body: CliGenerateBgmRequest | None = None) -> dict[str, Any]:
-    """调用官方 gemini-api music 一键生成原创配乐并绑定到本集"""
+def cli_generate_episode_bgm(
+    episode_id: int,
+    body: CliGenerateBgmRequest | None = None,
+    async_mode: bool = False,
+) -> dict[str, Any]:
+    """调用媒体引擎一键生成原创配乐并绑定到本集（支持 async_mode=True 走轻量异步任务中心）"""
+    req = body or CliGenerateBgmRequest()
     with db_ctx() as conn:
         row = conn.execute(
             "SELECT e.*, p.slug FROM episodes e JOIN projects p ON e.project_id = p.id WHERE e.id = ?",
@@ -1704,31 +1766,62 @@ def cli_generate_episode_bgm(episode_id: int, body: CliGenerateBgmRequest | None
         ).fetchone()
         if not row:
             raise HTTPException(status_code=404, detail="分集不存在")
-        prompt = ((body.prompt if body else None) or row["bgm_prompt"] or "").strip()
+        prompt = (req.prompt or row["bgm_prompt"] or "").strip()
         if not prompt:
             raise HTTPException(status_code=400, detail="请先填写或 AI 生成本集的英文配乐提示词（bgm_prompt）。")
         dest_dir = MEDIA_DIR / row["slug"] / f"ep{row['ep_number']:02d}"
         ep_num = row["ep_number"]
 
+    def _run_bgm(ctx: JobContext | None = None) -> dict[str, Any]:
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(progress_pct=15, stage_msg=f"正在生成第 {ep_num:02d} 集原创配乐 BGM...")
+        extra_cb: dict[str, Any] = {}
+        if ctx is not None:
+            extra_cb["progress_cb"] = _make_job_progress_cb(ctx)
+            extra_cb["cancel_check"] = ctx.is_cancelled
+        res = cli_generate_music(
+            prompt,
+            dest_dir,
+            stem=f"E{ep_num:02d}_lyria_bgm",
+            **_filter_supported_kwargs(cli_generate_music, extra_cb),
+        )
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(progress_pct=90, stage_msg="原创配乐已生成，正在绑定到分集...")
+        ts = now_str()
+        with db_ctx() as conn:
+            conn.execute(
+                "UPDATE episodes SET bgm_prompt = ?, bgm_file_path = ?, updated_at = ? WHERE id = ?",
+                (prompt, res["file_path"], ts, episode_id),
+            )
+            ep = dict(conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone())
+        return {
+            "episode": ep,
+            "file_path": res["file_path"],
+            "output_path": res["file_path"],
+            "filename": res["filename"],
+            "est_cost_usd": res["est_cost_usd"],
+            "model": res["model"],
+        }
+
+    use_async = bool(req.async_mode or async_mode)
+    if use_async:
+        job = submit_job(
+            "cli_bgm",
+            _run_bgm,
+            episode_id=episode_id,
+            target_host="local",
+            stage_msg=f"已排队：等待生成第 {ep_num:02d} 集原创配乐 BGM",
+        )
+        return {"ok": True, "async": True, "job_id": job["id"], "job": job}
+
     try:
-        res = cli_generate_music(prompt, dest_dir, stem=f"E{ep_num:02d}_lyria_bgm")
+        return _run_bgm(None)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-    ts = now_str()
-    with db_ctx() as conn:
-        conn.execute(
-            "UPDATE episodes SET bgm_prompt = ?, bgm_file_path = ?, updated_at = ? WHERE id = ?",
-            (prompt, res["file_path"], ts, episode_id),
-        )
-        ep = dict(conn.execute("SELECT * FROM episodes WHERE id = ?", (episode_id,)).fetchone())
-    return {
-        "episode": ep,
-        "file_path": res["file_path"],
-        "filename": res["filename"],
-        "est_cost_usd": res["est_cost_usd"],
-        "model": res["model"],
-    }
 
 
 @router.post("/assets/{asset_id}/cli-generate-clean")
@@ -1860,10 +1953,12 @@ def cli_generate_shot_frame(
     image_count: int = 4,
     image_model: str = "Nano Banana 2.1 Pro",
     video_count: int = 2,
+    async_mode: bool = False,
 ) -> dict[str, Any]:
-    """调用官方 gemini-api image 一键生成分镜首帧或尾帧（自动挂载本镜绑定资产参考图）"""
+    """调用媒体引擎一键生成分镜首帧或尾帧（自动挂载本镜绑定资产参考图，支持 async_mode=True）"""
     req = body or CliGenerateFrameRequest()
     slot = "end_frame" if req.slot == "end_frame" else "start_frame"
+    slot_cn = "尾帧" if slot == "end_frame" else "首帧"
 
     with db_ctx() as conn:
         row = conn.execute(
@@ -1915,7 +2010,18 @@ def cli_generate_shot_frame(
 
     dest_dir = make_shot_media_dir(shot["slug"], shot["ep_number"], shot["shot_no"])
     cand_dir = dest_dir / "cli_candidates"
-    try:
+
+    def _run_frame(ctx: JobContext | None = None) -> dict[str, Any]:
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(
+                progress_pct=10,
+                stage_msg=f"正在生成 S{shot['shot_no']:02d} {slot_cn}（{req.count} 张 · {req.image_size}）...",
+            )
+        extra_cb: dict[str, Any] = {}
+        if ctx is not None:
+            extra_cb["progress_cb"] = _make_job_progress_cb(ctx)
+            extra_cb["cancel_check"] = ctx.is_cancelled
         res = cli_generate_images(
             prompt=prompt,
             ref_paths=ref_paths,
@@ -1924,50 +2030,73 @@ def cli_generate_shot_frame(
             count=req.count,
             out_dir=cand_dir,
             prefix=f"E{shot['ep_number']:02d}_S{shot['shot_no']:02d}_{slot}",
+            **_filter_supported_kwargs(cli_generate_images, extra_cb),
         )
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(progress_pct=85, stage_msg=f"S{shot['shot_no']:02d} {slot_cn}已落盘，正在入库...")
+
+        auto_bound = False
+        dock_copy_name = ""
+        episode_data = None
+        primary_out = res["candidates"][0]["path"] if res.get("candidates") else ""
+        if len(res["candidates"]) == 1:
+            winner = Path(res["candidates"][0]["path"])
+            final_dest = dest_dir / f"E{shot['ep_number']:02d}_S{shot['shot_no']:02d}_{slot}{winner.suffix or '.jpg'}"
+            shutil.copy2(winner, final_dest)
+            primary_out = str(final_dest.resolve())
+            col = "end_frame_path" if slot == "end_frame" else "start_frame_path"
+            with db_ctx() as conn:
+                conn.execute(
+                    f"UPDATE shots SET {col} = ?, updated_at = ? WHERE id = ?",
+                    (primary_out, now_str(), shot_id),
+                )
+                episode_data = _hydrate_episode_shots(
+                    conn,
+                    shot["episode_id"],
+                    image_count=image_count,
+                    image_model=image_model,
+                    video_count=video_count,
+                )
+            auto_bound = True
+            if _should_keep_chinese_copy(None) and downloads_inbox is not None:
+                try:
+                    cn_stem = _shot_frame_chinese_copy_stem(shot["ep_number"], shot["shot_no"], slot_cn, shot.get("shot_title") or "")
+                    cp = downloads_inbox.copy_to_dock_downloads(final_dest, cn_stem)
+                    dock_copy_name = cp.name
+                except Exception:
+                    pass
+
+        return {
+            "slot": slot,
+            "auto_bound": auto_bound,
+            "dock_copy_name": dock_copy_name,
+            "output_path": primary_out,
+            "candidates": res["candidates"],
+            "est_cost_usd": res["est_cost_usd"],
+            "image_size": res["image_size"],
+            "model": res["model"],
+            "episode_data": episode_data,
+        }
+
+    use_async = bool(req.async_mode or async_mode)
+    if use_async:
+        job = submit_job(
+            "cli_frame",
+            _run_frame,
+            episode_id=int(shot["episode_id"]),
+            shot_id=shot_id,
+            target_host="local",
+            stage_msg=f"已排队：等待生成 S{shot['shot_no']:02d} {slot_cn}",
+        )
+        return {"ok": True, "async": True, "job_id": job["id"], "job": job}
+
+    try:
+        return _run_frame(None)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-    auto_bound = False
-    dock_copy_name = ""
-    episode_data = None
-    if len(res["candidates"]) == 1:
-        winner = Path(res["candidates"][0]["path"])
-        final_dest = dest_dir / f"E{shot['ep_number']:02d}_S{shot['shot_no']:02d}_{slot}{winner.suffix or '.jpg'}"
-        shutil.copy2(winner, final_dest)
-        col = "end_frame_path" if slot == "end_frame" else "start_frame_path"
-        with db_ctx() as conn:
-            conn.execute(
-                f"UPDATE shots SET {col} = ?, updated_at = ? WHERE id = ?",
-                (str(final_dest.resolve()), now_str(), shot_id),
-            )
-            episode_data = _hydrate_episode_shots(
-                conn,
-                shot["episode_id"],
-                image_count=image_count,
-                image_model=image_model,
-                video_count=video_count,
-            )
-        auto_bound = True
-        if _should_keep_chinese_copy(None) and downloads_inbox is not None:
-            try:
-                slot_cn = "尾帧" if slot == "end_frame" else "首帧"
-                cn_stem = _shot_frame_chinese_copy_stem(shot["ep_number"], shot["shot_no"], slot_cn, shot.get("shot_title") or "")
-                cp = downloads_inbox.copy_to_dock_downloads(final_dest, cn_stem)
-                dock_copy_name = cp.name
-            except Exception:
-                pass
-
-    return {
-        "slot": slot,
-        "auto_bound": auto_bound,
-        "dock_copy_name": dock_copy_name,
-        "candidates": res["candidates"],
-        "est_cost_usd": res["est_cost_usd"],
-        "image_size": res["image_size"],
-        "model": res["model"],
-        "episode_data": episode_data,
-    }
 
 
 @router.post("/shots/{shot_id}/select-frame-candidate")
@@ -2028,8 +2157,9 @@ def cli_generate_shot_video(
     image_count: int = 4,
     image_model: str = "Nano Banana 2.1 Pro",
     video_count: int = 2,
+    async_mode: bool = False,
 ) -> dict[str, Any]:
-    """调用官方 gemini-api video 一键生成 1–2 条视频，自动轮询落盘并写入 takes"""
+    """调用媒体引擎一键生成 1–2 条视频，自动轮询落盘并写入 takes（支持 async_mode=True）"""
     req = body or CliGenerateVideoRequest()
     with db_ctx() as conn:
         row = conn.execute(
@@ -2064,7 +2194,9 @@ def cli_generate_shot_video(
     sf_str = (shot.get("start_frame_path") or "").strip()
     ef_str = (shot.get("end_frame_path") or "").strip()
     start_frame = Path(sf_str) if (sf_str and Path(sf_str).exists()) else None
-    end_frame = Path(ef_str) if (ef_str and Path(ef_str).exists() and (shot.get("flow_mode") == "frames_to_video" or ef_str)) else None
+    # 仅 frames_to_video 模式才锁定尾帧，避免抽过末帧的普通镜头重拍时被错锁尾帧并截断到 10 秒
+    use_end_frame = shot.get("flow_mode") == "frames_to_video" and bool(ef_str)
+    end_frame = Path(ef_str) if (use_end_frame and Path(ef_str).exists()) else None
     ref_paths = [
         Path(r["image_path"])
         for r in (compiled.get("ref_images") or [])
@@ -2073,7 +2205,18 @@ def cli_generate_shot_video(
 
     dur = int(req.duration_sec or shot.get("duration_sec") or 6)
     dest_dir = make_shot_media_dir(shot["slug"], shot["ep_number"], shot["shot_no"])
-    try:
+
+    def _run_video(ctx: JobContext | None = None) -> dict[str, Any]:
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(
+                progress_pct=10,
+                stage_msg=f"正在生成 S{shot['shot_no']:02d} 视频（{req.resolution} · {dur}s · {req.count} 条）...",
+            )
+        extra_cb: dict[str, Any] = {}
+        if ctx is not None:
+            extra_cb["progress_cb"] = _make_job_progress_cb(ctx)
+            extra_cb["cancel_check"] = ctx.is_cancelled
         res = cli_generate_video(
             prompt=prompt,
             start_frame=start_frame,
@@ -2085,58 +2228,82 @@ def cli_generate_shot_video(
             count=req.count,
             out_dir=dest_dir,
             prefix=f"E{shot['ep_number']:02d}_S{shot['shot_no']:02d}",
+            **_filter_supported_kwargs(cli_generate_video, extra_cb),
         )
+        if ctx is not None:
+            ctx.check_cancelled()
+            ctx.update(progress_pct=90, stage_msg=f"S{shot['shot_no']:02d} 视频已落盘，正在写入版本库...")
+
+        ts = now_str()
+        engine_label = "SDK 直连" if res.get("engine") == "sdk" else "CLI 直出"
+        with db_ctx() as conn:
+            has_final = bool(
+                conn.execute(
+                    "SELECT 1 FROM takes WHERE shot_id = ? AND media_type = 'video' AND is_final = 1",
+                    (shot_id,),
+                ).fetchone()
+            )
+            for v in res["videos"]:
+                mark_final = 1 if not has_final else 0
+                if mark_final:
+                    has_final = True
+                conn.execute(
+                    """
+                    INSERT INTO takes (
+                        shot_id, media_type, file_path, original_filename,
+                        width, height, duration_sec, resolution_label, rating, is_final, notes, created_at
+                    ) VALUES (?, 'video', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        shot_id,
+                        v["path"],
+                        f"cli_video_{v['requested_resolution']}_{v['filename']}",
+                        v["width"],
+                        v["height"],
+                        v["duration_sec"],
+                        v["resolution_label"],
+                        4 if mark_final else 0,
+                        mark_final,
+                        f"{engine_label} ({res['model']} · {v['requested_resolution']} · 约 ${v['est_cost_usd']:.3f})",
+                        ts,
+                    ),
+                )
+            episode_data = _hydrate_episode_shots(
+                conn,
+                shot["episode_id"],
+                image_count=image_count,
+                image_model=image_model,
+                video_count=video_count,
+            )
+
+        first_vid_path = res["videos"][0]["path"] if res.get("videos") else ""
+        return {
+            "created_count": len(res["videos"]),
+            "est_cost_usd": res["est_cost_usd"],
+            "resolution": res["resolution"],
+            "model": res["model"],
+            "output_path": first_vid_path,
+            "episode_data": episode_data,
+        }
+
+    use_async = bool(req.async_mode or async_mode)
+    if use_async:
+        job = submit_job(
+            "cli_video",
+            _run_video,
+            episode_id=int(shot["episode_id"]),
+            shot_id=shot_id,
+            target_host="local",
+            stage_msg=f"已排队：等待生成 S{shot['shot_no']:02d} 视频（{req.resolution}）",
+        )
+        return {"ok": True, "async": True, "job_id": job["id"], "job": job}
+
+    try:
+        return _run_video(None)
+    except HTTPException:
+        raise
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
-
-    ts = now_str()
-    with db_ctx() as conn:
-        has_final = bool(
-            conn.execute(
-                "SELECT 1 FROM takes WHERE shot_id = ? AND media_type = 'video' AND is_final = 1",
-                (shot_id,),
-            ).fetchone()
-        )
-        for v in res["videos"]:
-            mark_final = 1 if not has_final else 0
-            if mark_final:
-                has_final = True
-            conn.execute(
-                """
-                INSERT INTO takes (
-                    shot_id, media_type, file_path, original_filename,
-                    width, height, duration_sec, resolution_label, rating, is_final, notes, created_at
-                ) VALUES (?, 'video', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    shot_id,
-                    v["path"],
-                    f"cli_video_{v['requested_resolution']}_{v['filename']}",
-                    v["width"],
-                    v["height"],
-                    v["duration_sec"],
-                    v["resolution_label"],
-                    4 if mark_final else 0,
-                    mark_final,
-                    f"CLI 直出 ({res['model']} · {v['requested_resolution']} · 约 ${v['est_cost_usd']:.3f})",
-                    ts,
-                ),
-            )
-        episode_data = _hydrate_episode_shots(
-            conn,
-            shot["episode_id"],
-            image_count=image_count,
-            image_model=image_model,
-            video_count=video_count,
-        )
-
-    return {
-        "created_count": len(res["videos"]),
-        "est_cost_usd": res["est_cost_usd"],
-        "resolution": res["resolution"],
-        "model": res["model"],
-        "episode_data": episode_data,
-    }
 
 
 # ==================== 门禁 1 编号审图总览拼图 & 手动 Flow 发车包 ====================
@@ -2319,9 +2486,16 @@ def build_episode_qc_frames_sheet(
         raise HTTPException(status_code=500, detail=f"生成首尾帧对比总览图失败：{exc}")
 
     sheet_abs = str(Path(res.get("output_path") or out_jpg).resolve())
+    if sheet_abs:
+        with db_ctx() as conn:
+            conn.execute(
+                "UPDATE episodes SET frames_sheet_path = ?, updated_at = ? WHERE id = ?",
+                (sheet_abs, now_str(), episode_id),
+            )
     return {
         "episode_id": episode_id,
         "sheet_path": sheet_abs,
+        "frames_sheet_path": sheet_abs,
         "output_path": sheet_abs,
         "image_count": len(entries),
         "cols": cols,

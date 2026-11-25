@@ -1,7 +1,8 @@
 """
 国内直连免登录实时热榜抓取模块（零登录凭据、零自动化风控风险）：
 - 所有请求均通过 `make_cn_async_client(trust_env=False)` 强制直连，不经海外代理；
-- 内置 10 分钟 SQLite 缓存，支持 `force=True` 实时刷新；
+- 内置 10 分钟 SQLite 缓存 + `DATA_DIR/.hot_cache_<source>.json` 磁盘历史缓存；
+- 第三方热榜源返回 403/500/超时时自动优雅降级至最近一次成功缓存并返回 `degraded=True` 与中文 `warning` 提示，不抛 502 炸页；
 - 可在系统设置中通过 `ENABLE_HOT_FEEDS` 一键关闭。
 """
 
@@ -10,8 +11,12 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Any
 
+import httpx
+
+from . import config as app_config
 from .db import db_ctx, now_str
 from .net import make_cn_async_client
 
@@ -239,10 +244,93 @@ FETCHERS = {
 }
 
 
+def _disk_cache_path(source: str) -> Path:
+    """热榜历史磁盘缓存文件路径：DATA_DIR/.hot_cache_<source>.json"""
+    return app_config.DATA_DIR / f".hot_cache_{source}.json"
+
+
+def _save_disk_cache(source: str, items: list[dict[str, Any]], fetched_at: str) -> None:
+    """原子写入最近一次成功拉取的热榜磁盘快照，供第三方源失效时优雅降级"""
+    if not items:
+        return
+    try:
+        cache_path = _disk_cache_path(source)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_suffix(".json.tmp")
+        payload = {
+            "source": source,
+            "fetched_at": fetched_at,
+            "items": items,
+        }
+        tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        tmp_path.replace(cache_path)
+    except OSError:
+        pass
+
+
+def _load_disk_cache(source: str) -> tuple[list[dict[str, Any]], str] | None:
+    """读取最近一次成功落盘的历史热榜快照"""
+    cache_path = _disk_cache_path(source)
+    if not cache_path.exists():
+        return None
+    try:
+        raw = json.loads(cache_path.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            items = raw.get("items")
+            fetched_at = str(raw.get("fetched_at") or "")
+            if isinstance(items, list) and items:
+                return items, fetched_at
+    except Exception:
+        return None
+    return None
+
+
+def _load_stale_db_cache(source: str) -> tuple[list[dict[str, Any]], str] | None:
+    """兜底读取 SQLite hot_cache 中可能已过期的历史记录"""
+    try:
+        with db_ctx() as conn:
+            row = conn.execute(
+                "SELECT payload, fetched_at FROM hot_cache WHERE source = ?",
+                (source,),
+            ).fetchone()
+            if row:
+                items = json.loads(row["payload"])
+                if isinstance(items, list) and items:
+                    return items, str(row["fetched_at"] or "")
+    except Exception:
+        return None
+    return None
+
+
+def _summarize_fetch_error(exc: Exception) -> str:
+    """将上游热榜异常提炼为简短友好的中文降级说明"""
+    if isinstance(exc, httpx.HTTPStatusError):
+        code = exc.response.status_code
+        if code in (401, 403):
+            return f"上游返回 HTTP {code} 访问受限"
+        if code == 429:
+            return "上游触发频率限制（HTTP 429）"
+        if code >= 500:
+            return f"上游服务暂不可用（HTTP {code}）"
+        return f"上游返回 HTTP {code}"
+    if isinstance(exc, httpx.TimeoutException):
+        return "请求超时"
+    if isinstance(exc, httpx.RequestError):
+        return "网络连接失败"
+    msg = str(exc).strip()
+    return msg[:80] if msg else "上游接口异常"
+
+
 async def get_hot_list(source: str = "douyin", force: bool = False) -> dict[str, Any]:
-    """获取指定平台公开热榜（优先走 10 分钟 SQLite 缓存，强制直连）"""
+    """
+    获取指定平台公开热榜（优先 10 分钟 SQLite 缓存，强制直连）：
+    - 拉取成功时同步落盘 `DATA_DIR/.hot_cache_<source>.json`；
+    - 第三方源 403/500/超时时优先回退历史缓存，返回 `degraded=True` 与中文 `warning` 提示，不抛 502。
+    """
     if source not in FETCHERS:
         raise ValueError(f"不支持的热榜来源: {source}")
+
+    label = SUPPORTED_SOURCES[source]
 
     if not force:
         with db_ctx() as conn:
@@ -254,19 +342,54 @@ async def get_hot_list(source: str = "douyin", force: bool = False) -> dict[str,
                 try:
                     fetched_dt = datetime.strptime(row["fetched_at"], "%Y-%m-%d %H:%M:%S")
                     if datetime.now() - fetched_dt < timedelta(seconds=CACHE_TTL_SECONDS):
-                        return {
-                            "source": source,
-                            "source_label": SUPPORTED_SOURCES[source],
-                            "cached": True,
-                            "fetched_at": row["fetched_at"],
-                            "latency_ms": 0,
-                            "items": json.loads(row["payload"]),
-                        }
+                        cached_items = json.loads(row["payload"])
+                        if isinstance(cached_items, list) and cached_items:
+                            return {
+                                "source": source,
+                                "source_label": label,
+                                "cached": True,
+                                "degraded": False,
+                                "warning": "",
+                                "fetched_at": row["fetched_at"],
+                                "latency_ms": 0,
+                                "items": cached_items,
+                            }
                 except Exception:
                     pass
 
     t0 = time.perf_counter()
-    items = await FETCHERS[source]()
+    try:
+        items = await FETCHERS[source]()
+        if not items:
+            raise RuntimeError("返回列表为空")
+    except Exception as exc:
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        reason = _summarize_fetch_error(exc)
+        fallback = _load_disk_cache(source) or _load_stale_db_cache(source)
+        if fallback is not None:
+            stale_items, stale_ts = fallback
+            time_hint = f" {stale_ts}" if stale_ts else ""
+            return {
+                "source": source,
+                "source_label": label,
+                "cached": True,
+                "degraded": True,
+                "warning": f"{label}实时源暂不可用（{reason}），已自动回退至{time_hint}的历史缓存。",
+                "fetched_at": stale_ts,
+                "latency_ms": latency_ms,
+                "items": stale_items,
+            }
+        return {
+            "source": source,
+            "source_label": label,
+            "cached": False,
+            "degraded": True,
+            "warning": f"{label}实时源暂不可用（{reason}），且尚无历史缓存；请稍后重试或切换其他热榜源。",
+            "fetched_at": "",
+            "latency_ms": latency_ms,
+            "items": [],
+        }
+
     latency_ms = int((time.perf_counter() - t0) * 1000)
     ts = now_str()
 
@@ -279,12 +402,20 @@ async def get_hot_list(source: str = "douyin", force: bool = False) -> dict[str,
             """,
             (source, json.dumps(items, ensure_ascii=False), ts),
         )
+    _save_disk_cache(source, items, ts)
 
     return {
         "source": source,
-        "source_label": SUPPORTED_SOURCES[source],
+        "source_label": label,
         "cached": False,
+        "degraded": False,
+        "warning": "",
         "fetched_at": ts,
         "latency_ms": latency_ms,
         "items": items,
     }
+
+
+async def get_hot_list_with_status(source: str = "douyin", force: bool = False) -> dict[str, Any]:
+    """带降级状态字段的热榜获取入口（与 get_hot_list 返回结构完全一致）"""
+    return await get_hot_list(source=source, force=force)

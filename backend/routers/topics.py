@@ -90,17 +90,44 @@ async def fetch_hot_source(source: str, force: bool = False) -> dict[str, Any]:
             "fetched_at": "",
             "latency_ms": 0,
             "items": [],
+            "degraded": False,
+            "warning": "",
             "message": "国内热榜雷达当前已在系统设置中关闭，可在「系统设置」开启 ENABLE_HOT_FEEDS 后重新获取。",
         }
     try:
         data = await get_hot_list(source=source, force=force)
         if isinstance(data, dict):
-            return {"enabled": True, **data}
-        return {"enabled": True, "source": source, "items": []}
+            payload = {"enabled": True, **data}
+            payload["degraded"] = bool(payload.get("degraded", False))
+            payload["warning"] = str(payload.get("warning") or "")
+            return payload
+        return {
+            "enabled": True,
+            "source": source,
+            "source_label": SUPPORTED_SOURCES.get(source, source),
+            "cached": False,
+            "fetched_at": "",
+            "latency_ms": 0,
+            "items": [],
+            "degraded": False,
+            "warning": "",
+        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc))
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"直连抓取 {source} 热榜失败：{exc}")
+        # 优雅降级：热榜源挂掉时透传 degraded 与中文 warning，不再直接抛 502 导致页面报错
+        source_label = SUPPORTED_SOURCES.get(source, source)
+        return {
+            "enabled": True,
+            "source": source,
+            "source_label": source_label,
+            "cached": False,
+            "fetched_at": "",
+            "latency_ms": 0,
+            "items": [],
+            "degraded": True,
+            "warning": f"{source_label} 实时源暂不可用，已自动降级展示（{exc}）。可稍后点击刷新重试或改用关键词搜题。",
+        }
 
 
 @router.get("/topics")

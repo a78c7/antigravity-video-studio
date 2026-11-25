@@ -338,6 +338,7 @@ class SettingsPatch(BaseModel):
     DEEPSEEK_API_KEY: str | None = None
     DEEPSEEK_MODEL: str | None = None
     DEFAULT_PROVIDER: str | None = None
+    MEDIA_ENGINE_MODE: str | None = None
     CLI_IMAGE_MODEL: str | None = None
     CLI_VIDEO_MODEL: str | None = None
     CLI_MUSIC_MODEL: str | None = None
@@ -418,6 +419,15 @@ def save_settings(body: SettingsPatch) -> dict[str, Any]:
                 detail=f"不支持的订阅档位：{tier_val}，可选：{', '.join(SUBSCRIPTION_PRESETS.keys())}",
             )
         updates["SUBSCRIPTION_TIER"] = tier_val or "custom"
+
+    if "MEDIA_ENGINE_MODE" in updates:
+        engine_mode = str(updates["MEDIA_ENGINE_MODE"]).strip().lower()
+        if engine_mode not in ("auto", "sdk", "cli"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"不支持的媒体引擎模式：{engine_mode}，可选：auto / sdk / cli",
+            )
+        updates["MEDIA_ENGINE_MODE"] = engine_mode
 
     old_cfg = get_public_config()
     update_config(updates)

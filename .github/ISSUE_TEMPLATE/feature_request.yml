@@ -1,0 +1,34 @@
+name: "功能建议（Feature Request）"
+description: "提出新功能想法、体验改进或工作流优化建议"
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        欢迎提出改进建议！本项目坚持 **单进程轻量本地优先 + 0 封号红线（不做 Flow 爬取 / 不做第三方自动发评）+ 专注 Google Gemini / Flow / Colab / Antigravity 生态**。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: "痛点场景"
+      description: "你在制作 AI 短剧的哪个环节遇到了不便？"
+      placeholder: "例如：在阶段 6 混音时，希望..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: "期望方案"
+      description: "你理想中的交互、API 或参数设计是什么样的？"
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: "替代方案或参考说明（可选）"
+      description: "是否有现成变通方式或其他参考思路？"
+    validations:
+      required: false

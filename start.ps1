@@ -1,5 +1,8 @@
 ﻿$ErrorActionPreference = "Stop"
+$env:PYTHONUTF8 = "1"
+[Console]::InputEncoding = [System.Text.Encoding]::UTF8
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
 
 Set-Location -Path $PSScriptRoot
 
@@ -117,12 +120,33 @@ $VenvUvicorn = Join-Path $PSScriptRoot ".venv\Scripts\uvicorn.exe"
 if (-not (Test-Path $VenvPython) -or -not (Test-Path $VenvUvicorn)) {
     Write-Host "正在初始化 Python 3.12+ 虚拟环境并安装依赖..." -ForegroundColor Cyan
     if (Get-Command uv -ErrorAction SilentlyContinue) {
+        $UvVenvOk = $false
         try {
             & uv venv --python 3.12 .venv
+            if ($LASTEXITCODE -eq 0 -and (Test-Path $VenvPython)) {
+                $UvVenvOk = $true
+            }
         } catch {
+            $UvVenvOk = $false
+        }
+        if (-not $UvVenvOk) {
+            Write-Host "提示：uv venv --python 3.12 未成功，尝试使用默认 Python 创建虚拟环境..." -ForegroundColor Yellow
             & uv venv .venv
+            if ($LASTEXITCODE -ne 0 -or -not (Test-Path $VenvPython)) {
+                Write-Host "错误：uv 创建 Python 虚拟环境失败（退出码 $LASTEXITCODE）。" -ForegroundColor Red
+                Write-Host "排查建议：请确认网络可达或先安装 Python 3.12+（winget install Python.Python.3.12），删除残损的 .venv 目录后重试。" -ForegroundColor Yellow
+                exit 1
+            }
         }
         & uv pip install --python $VenvPython @Deps
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "错误：uv 安装项目依赖失败（退出码 $LASTEXITCODE）。" -ForegroundColor Red
+            Write-Host "排查建议：" -ForegroundColor Yellow
+            Write-Host "  1. 检查网络连接，或排查系统代理是否拦截 PyPI 访问；" -ForegroundColor Yellow
+            Write-Host "  2. 国内网络建议设置镜像源后重试：" -ForegroundColor Yellow
+            Write-Host '     $env:UV_DEFAULT_INDEX="https://pypi.tuna.tsinghua.edu.cn/simple"; .\start.ps1' -ForegroundColor Yellow
+            exit 1
+        }
     } else {
         $PyCmd = Find-Python312
         if (-not $PyCmd) {
@@ -134,14 +158,35 @@ if (-not (Test-Path $VenvPython) -or -not (Test-Path $VenvUvicorn)) {
         } else {
             & $PyCmd[0] -m venv .venv
         }
+        if ($LASTEXITCODE -ne 0 -or -not (Test-Path $VenvPython)) {
+            Write-Host "错误：创建 Python 虚拟环境 .venv 失败（退出码 $LASTEXITCODE）。" -ForegroundColor Red
+            Write-Host "排查建议：请检查当前目录写入权限，或删除残损的 .venv 目录后重试。" -ForegroundColor Yellow
+            exit 1
+        }
         & $VenvPython -m pip install --upgrade pip
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "提示：升级 pip 失败（退出码 $LASTEXITCODE），将尝试继续安装项目依赖..." -ForegroundColor Yellow
+        }
         & $VenvPython -m pip install @Deps
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "错误：pip 安装项目依赖失败（退出码 $LASTEXITCODE）。" -ForegroundColor Red
+            Write-Host "排查建议：" -ForegroundColor Yellow
+            Write-Host "  1. 检查网络连接，或排查系统代理是否拦截 PyPI 访问；" -ForegroundColor Yellow
+            Write-Host "  2. 国内网络建议设置镜像源后重试：" -ForegroundColor Yellow
+            Write-Host '     $env:PIP_INDEX_URL="https://pypi.tuna.tsinghua.edu.cn/simple"; .\start.ps1' -ForegroundColor Yellow
+            exit 1
+        }
+    }
+
+    if (-not (Test-Path $VenvPython) -or -not (Test-Path $VenvUvicorn)) {
+        Write-Host "错误：依赖安装后仍未找到 .venv\Scripts\uvicorn.exe，请删除 .venv 目录后重新运行 start.bat / start.ps1。" -ForegroundColor Red
+        exit 1
     }
 }
 
 if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) {
     Write-Host "提示：未检测到 ffmpeg，本地视频剪辑、混音与音画体检功能需安装 ffmpeg。" -ForegroundColor Yellow
-    Write-Host "  可执行：winget install Gyan.FFmpeg（安装后重开终端即可生效）" -ForegroundColor Yellow
+    Write-Host "  推荐安装：winget install Gyan.FFmpeg（安装后重开终端即可生效）" -ForegroundColor Yellow
 }
 
 Write-Host "启动「反重力视频工坊」本地制片台：$Url" -ForegroundColor Green

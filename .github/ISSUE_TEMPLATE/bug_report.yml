@@ -1,0 +1,91 @@
+name: "Bug 反馈（缺陷报告）"
+description: "反馈启动失败、接口报错、媒体生成异常或音画渲染问题"
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！提交前请先核对 **切勿在日志或截图中暴露明文 `GEMINI_API_KEY`、代理密码或 `.secrets.env` 内容**。
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: "操作系统"
+      description: "请选择运行本地制片台的操作系统"
+      options:
+        - "macOS (Apple Silicon / M 系列)"
+        - "macOS (Intel)"
+        - "Windows 11"
+        - "Windows 10"
+        - "Linux (Ubuntu / Debian / 其他)"
+    validations:
+      required: true
+
+  - type: input
+    id: python_version
+    attributes:
+      label: "Python 版本与环境方式"
+      description: "例如：Python 3.12.8（uv / winget / Homebrew / 系统自带）"
+      placeholder: "Python 3.12.x (uv)"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: ffmpeg_status
+    attributes:
+      label: "FFmpeg 状态"
+      description: "可在网页顶部体检条或终端 `ffmpeg -version` 查看"
+      options:
+        - "已安装且 `/api/health` 显示 ffmpeg_ok = true"
+        - "未安装 FFmpeg"
+        - "已安装但系统 PATH 未识别 / 报错"
+        - "不确定"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: proxy_and_engine
+    attributes:
+      label: "代理开关与媒体引擎模式"
+      description: "请说明当前 Google 访问方式及系统设置中的 MEDIA_ENGINE_MODE"
+      options:
+        - "直连（未填 GOOGLE_PROXY_URL）· MEDIA_ENGINE_MODE = auto"
+        - "本地代理（已填 GOOGLE_PROXY_URL）· MEDIA_ENGINE_MODE = auto"
+        - "直连 · MEDIA_ENGINE_MODE = sdk"
+        - "本地代理 · MEDIA_ENGINE_MODE = sdk"
+        - "直连 · MEDIA_ENGINE_MODE = cli"
+        - "本地代理 · MEDIA_ENGINE_MODE = cli"
+        - "仅使用手动 Google Flow 模式"
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: "复现步骤与现象"
+      description: "请简要描述：你点击了什么 / 调了哪个接口 → 预期结果 → 实际报错"
+      placeholder: |
+        1. 启动服务：双击 start.bat / 运行 ./start.sh
+        2. 打开页面并执行：...
+        3. 预期结果：...
+        4. 实际结果：...
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: "脱敏日志或 `/api/health` 返回"
+      description: "请粘贴脱敏后的终端输出或报错信息（务必隐去任何 API Key 与个人敏感路径）"
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: "提交前隐私自查"
+      options:
+        - label: "我已确认提交内容不包含任何明文 API Key、Token 或个人隐私路径"
+          required: true

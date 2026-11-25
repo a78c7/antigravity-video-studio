@@ -40,10 +40,13 @@ import {
   Wand2,
 } from 'lucide-react';
 import { api, copyToClipboard, mediaUrl } from '../api';
+import { AsyncJobsPanel } from '../components/AsyncJobsPanel';
 import type { CloudSection } from '../components/CloudWorkspaceView';
+import { BatchTtsAndVoPanel, FramesSheetTool, VideoQcInspectTool } from '../components/QcAndAudioTools';
 import type {
   AppMode,
   Asset,
+  AsyncJob,
   AuthUser,
   BudgetSummary,
   CliImageCandidate,
@@ -164,12 +167,14 @@ export const LocalWorkspacePage: React.FC<Props> = ({
   const cliImageModel = settings?.cli_image_model || 'gemini-nano-banana-2.1';
   const cliVideoModel = settings?.cli_video_model || 'gemini-omni-1.2-flash';
   const cliMusicModel = settings?.cli_music_model || 'lyria-3.5';
+  const cliTtsModel = settings?.cli_tts_model || 'gemini-3.8-flash-tts';
   const priceImg1K = settings?.cli_pricing?.image?.['1K'] ?? 0.0336;
   const priceImg2K = settings?.cli_pricing?.image?.['2K'] ?? 0.0504;
   const priceVid360 = settings?.cli_pricing?.video_per_sec?.['360p'] ?? 0.023;
   const priceVid720 = settings?.cli_pricing?.video_per_sec?.['720p'] ?? 0.07;
   const priceVid1080 = settings?.cli_pricing?.video_per_sec?.['1080p'] ?? 0.104;
   const priceMusic = settings?.cli_pricing?.music ?? 0.08;
+  const priceTts = settings?.cli_pricing?.tts ?? 0.01;
 
   const [step, setStep] = useState<number>(1);
   const [proj, setProj] = useState<Project>(project);
@@ -214,8 +219,10 @@ export const LocalWorkspacePage: React.FC<Props> = ({
   );
   const flowParamsRef = useRef({ imageModel: flowImageModel, imageCount: flowImageCount, videoCount: flowVideoCount });
 
-  // 官方 gemini-api CLI 一键直出参数（走 API 月度预算，不消耗 Flow 积分）
-  const [cliBusyKey, setCliBusyKey] = useState<string | null>(null);
+  // SDK 直连 / CLI 媒体生成参数（按目标粒度记录活跃态，解锁并发，不再全局单锁）
+  const [cliBusyKeys, setCliBusyKeys] = useState<Set<string>>(() => new Set());
+  const [asyncJobsRefreshTick, setAsyncJobsRefreshTick] = useState(0);
+  const [activeAsyncJobs, setActiveAsyncJobs] = useState<AsyncJob[]>([]);
   const [cliImageSize, setCliImageSize] = useState<'1K' | '2K'>(
     () => (localStorage.getItem('agvs_cli_img_size') === '1K' ? '1K' : '2K')
   );
@@ -259,6 +266,7 @@ export const LocalWorkspacePage: React.FC<Props> = ({
   const [colabBurnSubtitles, setColabBurnSubtitles] = useState(true);
   const [localHdrHlg, setLocalHdrHlg] = useState(true);
   const [localBurnSubtitles, setLocalBurnSubtitles] = useState(true);
+  const [localVoSyncMode, setLocalVoSyncMode] = useState<'pad' | 'speed'>('pad');
   const [rendering, setRendering] = useState(false);
 
   // 可选远程协作同步 + 双比例封面 + 手动 Flow 发车包状态
@@ -314,6 +322,53 @@ export const LocalWorkspacePage: React.FC<Props> = ({
     window.dispatchEvent(new Event('agvs-quota-refresh'));
   };
 
+  const setBusyFlag = (key: string, busy: boolean) => {
+    setCliBusyKeys((prev) => {
+      const next = new Set(prev);
+      if (busy) next.add(key);
+      else next.delete(key);
+      return next;
+    });
+  };
+
+  const isKeyBusy = (key: string) => cliBusyKeys.has(key);
+
+  const isShotJobActive = (shotId: number, types: string[]) =>
+    activeAsyncJobs.some((j) => j.shot_id === shotId && types.includes(j.job_type));
+
+  const isEpJobActive = (types: string[]) =>
+    activeAsyncJobs.some((j) => types.includes(j.job_type));
+
+  const triggerAsyncJobsRefresh = () => {
+    setAsyncJobsRefreshTick((n) => n + 1);
+  };
+
+  const handleAsyncJobCompleted = async (job: AsyncJob) => {
+    triggerQuotaRefresh();
+    const res = job.result || {};
+    if (
+      job.status === 'done' &&
+      job.shot_id &&
+      Array.isArray(res.candidates) &&
+      res.candidates.length > 0 &&
+      res.slot &&
+      !res.auto_bound
+    ) {
+      setShotFrameCandidates((prev) => ({
+        ...prev,
+        [`${job.shot_id}:${res.slot}`]: res.candidates as CliImageCandidate[],
+      }));
+    }
+    if (job.status === 'done' && Array.isArray(res.candidates) && job.job_type.includes('cover')) {
+      setCoverCandidates(res.candidates as CoverCandidate[]);
+      if (res.sheet_path) setCoverSheetPath(String(res.sheet_path));
+    }
+    if (activeEpIdRef.current) {
+      await loadEpisodeShots(activeEpIdRef.current, { silent: true }).catch(() => {});
+      await loadTimeline(activeEpIdRef.current).catch(() => {});
+    }
+  };
+
   const estimateCliVideoCost = (durationSec: number) => {
     const rate = cliVideoRes === '1080p' ? priceVid1080 : cliVideoRes === '720p' ? priceVid720 : priceVid360;
     return (Math.max(3, durationSec || 6) * rate * cliVideoCount).toFixed(2);
@@ -326,25 +381,37 @@ export const LocalWorkspacePage: React.FC<Props> = ({
       notify('请先填写或 AI 生成本集的英文配乐提示词', 'err');
       return;
     }
-    setCliBusyKey('bgm');
+    setBusyFlag('bgm', true);
     try {
-      const res = await api.post<{ episode: Episode; est_cost_usd: number; filename: string }>(
-        `/api/episodes/${activeEpId}/cli-generate-bgm`,
-        { prompt: promptText }
-      );
-      setEpDraft(res.episode);
-      await loadEpisodeShots(activeEpId);
-      triggerQuotaRefresh();
-      notify(`CLI 已生成原创配乐 ${res.filename}（${cliMusicModel} · 约 $${res.est_cost_usd.toFixed(2)}）`);
+      const res = await api.post<{
+        async?: boolean;
+        job_id?: number;
+        episode?: Episode;
+        est_cost_usd?: number;
+        filename?: string;
+      }>(`/api/episodes/${activeEpId}/cli-generate-bgm`, {
+        prompt: promptText,
+        async_mode: true,
+      });
+      if (res.async || res.job_id) {
+        triggerAsyncJobsRefresh();
+        notify(`已提交后台原创配乐生成任务（${cliMusicModel}），可在顶部任务队列查看进度`);
+      } else if (res.episode) {
+        setEpDraft(res.episode);
+        await loadEpisodeShots(activeEpId);
+        triggerQuotaRefresh();
+        notify(`已生成原创配乐 ${res.filename || ''}（${cliMusicModel} · 约 $${(res.est_cost_usd || 0).toFixed(2)}）`);
+      }
     } catch (err: any) {
       notify(err.message, 'err');
     } finally {
-      setCliBusyKey(null);
+      setBusyFlag('bgm', false);
     }
   };
 
   const handleCliGenerateAssetClean = async (asset: Asset, mode: 'portrait' | 'full' = 'portrait') => {
-    setCliBusyKey(`asset-${asset.id}`);
+    const key = `asset-${asset.id}`;
+    setBusyFlag(key, true);
     try {
       const res = await api.post<{
         asset: Asset;
@@ -367,23 +434,24 @@ export const LocalWorkspacePage: React.FC<Props> = ({
         await loadProjectCore({ silent: true });
         if (activeEpId) await loadEpisodeShots(activeEpId, { silent: true });
         notify(
-          `CLI 棚拍定妆图已直接绑定「${asset.name}」（约 $${res.est_cost_usd.toFixed(3)}）${
+          `棚拍定妆图已直接绑定「${asset.name}」（约 $${res.est_cost_usd.toFixed(3)}）${
             res.dock_copy_name ? `，并同步到直拖目录：${res.dock_copy_name}` : ''
           }`
         );
       } else {
         setAssetCandidates((prev) => ({ ...prev, [asset.id]: res.candidates }));
-        notify(`CLI 已生成 ${res.candidates.length} 张「${asset.name}」棚拍候选图（约 $${res.est_cost_usd.toFixed(3)}），请在卡片内点选定妆`);
+        notify(`已生成 ${res.candidates.length} 张「${asset.name}」棚拍候选图（约 $${res.est_cost_usd.toFixed(3)}），请在卡片内点选定妆`);
       }
     } catch (err: any) {
       notify(err.message, 'err');
     } finally {
-      setCliBusyKey(null);
+      setBusyFlag(key, false);
     }
   };
 
   const handleSelectAssetCandidate = async (asset: Asset, cand: CliImageCandidate) => {
-    setCliBusyKey(`asset-pick-${asset.id}`);
+    const key = `asset-pick-${asset.id}`;
+    setBusyFlag(key, true);
     try {
       const res = await api.post<{ asset: Asset; dock_copy_name?: string }>(
         `/api/assets/${asset.id}/select-clean-candidate`,
@@ -402,29 +470,37 @@ export const LocalWorkspacePage: React.FC<Props> = ({
     } catch (err: any) {
       notify(err.message, 'err');
     } finally {
-      setCliBusyKey(null);
+      setBusyFlag(key, false);
     }
   };
 
   const handleCliGenerateShotFrame = async (shot: Shot, slot: 'start_frame' | 'end_frame') => {
     const key = `frame-${shot.id}-${slot}`;
-    setCliBusyKey(key);
+    setBusyFlag(key, true);
     try {
       const res = await api.post<{
-        slot: string;
-        auto_bound: boolean;
+        async?: boolean;
+        job_id?: number;
+        slot?: string;
+        auto_bound?: boolean;
         dock_copy_name?: string;
-        candidates: CliImageCandidate[];
-        est_cost_usd: number;
+        candidates?: CliImageCandidate[];
+        est_cost_usd?: number;
         episode_data?: { shots: Shot[]; budget: BudgetSummary };
       }>(`/api/shots/${shot.id}/cli-generate-frame${flowCompileQuery()}`, {
         slot,
         image_size: cliImageSize,
         count: cliImageCount,
+        async_mode: true,
       });
+      const slotCn = slot === 'end_frame' ? '尾帧' : '首帧';
+      if (res.async || res.job_id) {
+        triggerAsyncJobsRefresh();
+        notify(`已提交 S${String(shot.shot_no).padStart(2, '0')} ${slotCn}后台生图任务，可继续并发生成其他镜头！`);
+        return;
+      }
       triggerQuotaRefresh();
       const candKey = `${shot.id}:${slot}`;
-      const slotCn = slot === 'end_frame' ? '尾帧' : '首帧';
       if (res.auto_bound && res.episode_data) {
         setShots(res.episode_data.shots);
         setBudget(res.episode_data.budget);
@@ -434,25 +510,26 @@ export const LocalWorkspacePage: React.FC<Props> = ({
           return next;
         });
         notify(
-          `CLI 已生成并绑定 S${String(shot.shot_no).padStart(2, '0')} ${slotCn}（约 $${res.est_cost_usd.toFixed(3)}）${
+          `已生成并绑定 S${String(shot.shot_no).padStart(2, '0')} ${slotCn}（约 $${(res.est_cost_usd || 0).toFixed(3)}）${
             res.dock_copy_name ? `，已同步直拖目录：${res.dock_copy_name}` : ''
           }`
         );
-      } else {
-        setShotFrameCandidates((prev) => ({ ...prev, [candKey]: res.candidates }));
+      } else if (res.candidates) {
+        setShotFrameCandidates((prev) => ({ ...prev, [candKey]: res.candidates! }));
         notify(
-          `CLI 已出 ${res.candidates.length} 张 S${String(shot.shot_no).padStart(2, '0')} ${slotCn}候选（约 $${res.est_cost_usd.toFixed(3)}），请点击下方缩略图选定`
+          `已出 ${res.candidates.length} 张 S${String(shot.shot_no).padStart(2, '0')} ${slotCn}候选（约 $${(res.est_cost_usd || 0).toFixed(3)}），请点击下方缩略图选定`
         );
       }
     } catch (err: any) {
       notify(err.message, 'err');
     } finally {
-      setCliBusyKey(null);
+      setBusyFlag(key, false);
     }
   };
 
   const handleSelectShotFrameCandidate = async (shot: Shot, slot: 'start_frame' | 'end_frame', cand: CliImageCandidate) => {
-    setCliBusyKey(`pick-${shot.id}-${slot}`);
+    const key = `pick-${shot.id}-${slot}`;
+    setBusyFlag(key, true);
     try {
       const res = await api.post<{
         dock_copy_name?: string;
@@ -475,33 +552,46 @@ export const LocalWorkspacePage: React.FC<Props> = ({
     } catch (err: any) {
       notify(err.message, 'err');
     } finally {
-      setCliBusyKey(null);
+      setBusyFlag(key, false);
     }
   };
 
   const handleCliGenerateShotVideo = async (shot: Shot) => {
-    setCliBusyKey(`video-${shot.id}`);
+    const key = `video-${shot.id}`;
+    setBusyFlag(key, true);
     try {
       const res = await api.post<{
-        created_count: number;
-        est_cost_usd: number;
-        resolution: string;
-        episode_data: { shots: Shot[]; budget: BudgetSummary };
+        async?: boolean;
+        job_id?: number;
+        created_count?: number;
+        est_cost_usd?: number;
+        resolution?: string;
+        episode_data?: { shots: Shot[]; budget: BudgetSummary };
       }>(`/api/shots/${shot.id}/cli-generate-video${flowCompileQuery()}`, {
         resolution: cliVideoRes,
         count: cliVideoCount,
         duration_sec: shot.duration_sec,
+        async_mode: true,
       });
-      setShots(res.episode_data.shots);
-      setBudget(res.episode_data.budget);
+      if (res.async || res.job_id) {
+        triggerAsyncJobsRefresh();
+        notify(
+          `已提交 S${String(shot.shot_no).padStart(2, '0')} 后台生视频任务（${cliVideoRes}×${cliVideoCount}），可自由切换或并发提交其他镜头！`
+        );
+        return;
+      }
+      if (res.episode_data) {
+        setShots(res.episode_data.shots);
+        setBudget(res.episode_data.budget);
+      }
       triggerQuotaRefresh();
       notify(
-        `CLI 已直出 ${res.created_count} 条 S${String(shot.shot_no).padStart(2, '0')} 视频（${cliVideoModel} · ${res.resolution} · 约 $${res.est_cost_usd.toFixed(2)}）并自动入库！`
+        `已直出 ${res.created_count || 1} 条 S${String(shot.shot_no).padStart(2, '0')} 视频（${cliVideoModel} · ${res.resolution || cliVideoRes} · 约 $${(res.est_cost_usd || 0).toFixed(2)}）并自动入库！`
       );
     } catch (err: any) {
       notify(err.message, 'err');
     } finally {
-      setCliBusyKey(null);
+      setBusyFlag(key, false);
     }
   };
 
@@ -620,7 +710,7 @@ export const LocalWorkspacePage: React.FC<Props> = ({
               <img src={mediaUrl(c.path)} alt={c.filename} className="h-32 w-full rounded object-contain bg-slate-900" />
               <button
                 type="button"
-                disabled={cliBusyKey !== null}
+                disabled={isKeyBusy(`pick-${shot.id}-${slot}`)}
                 onClick={() => handleSelectShotFrameCandidate(shot, slot, c)}
                 className="w-full rounded bg-indigo-600 py-1 text-[10px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-45 cursor-pointer"
               >
@@ -861,13 +951,21 @@ export const LocalWorkspacePage: React.FC<Props> = ({
     setCoverBusy(true);
     try {
       const res = await api.post<{
+        async?: boolean;
+        job_id?: number;
         sheet_path?: string;
-        candidates: CoverCandidate[];
+        candidates?: CoverCandidate[];
         total_cost_usd?: number;
       }>(`/api/episodes/${activeEpId}/cli-generate-covers`, {
         count_per_ratio: 2,
         image_size: '2K',
+        async_mode: true,
       });
+      if (res.async || res.job_id) {
+        triggerAsyncJobsRefresh();
+        notify('已提交后台双比例封面生成任务（9:16 + 3:4），完成后将自动刷新候选列表！');
+        return;
+      }
       setCoverCandidates(res.candidates || []);
       if (res.sheet_path) setCoverSheetPath(res.sheet_path);
       triggerQuotaRefresh();
@@ -1500,13 +1598,25 @@ export const LocalWorkspacePage: React.FC<Props> = ({
     try {
       if (kind === 'local' || kind === 'local_hdr') {
         const useHdr = kind === 'local_hdr' ? true : localHdrHlg;
-        const res = await api.post<{ output_path: string; log: string }>(`/api/episodes/${activeEpId}/render-local`, {
-          hdr_hlg: useHdr,
-          burn_subtitles: localBurnSubtitles,
-        });
-        notify(res.log || (useHdr ? '本机 1080p 10-bit HLG HDR 三轨母带已完成！' : '本机 1080p 三轨初审片已完成！'));
-        await loadTimeline(activeEpId);
-        await loadEpisodeShots(activeEpId);
+        const res = await api.post<{ async?: boolean; job_id?: number; output_path?: string; log?: string }>(
+          `/api/episodes/${activeEpId}/render-local`,
+          {
+            hdr_hlg: useHdr,
+            burn_subtitles: localBurnSubtitles,
+            vo_sync_mode: localVoSyncMode,
+            async_mode: true,
+          }
+        );
+        if (res.async || res.job_id) {
+          triggerAsyncJobsRefresh();
+          notify(
+            `已提交本机 1080p 三轨混音渲染任务（对齐：${localVoSyncMode === 'speed' ? '微加速 speed' : '尾帧定格 pad'}），可在顶部任务队列实时查看进度与取消！`
+          );
+        } else {
+          notify(res.log || (useHdr ? '本机 1080p 10-bit HLG HDR 三轨母带已完成！' : '本机 1080p 三轨初审片已完成！'));
+          await loadTimeline(activeEpId);
+          await loadEpisodeShots(activeEpId);
+        }
       } else if (kind === 'fcpxml') {
         const res = await api.post<{ fcpxml_path: string; bundle_dir: string }>(`/api/episodes/${activeEpId}/export-fcpxml`);
         notify('已导出 .fcpxml + .srt，正在打开导出目录（剪映点“导入工程”直读）');
@@ -1520,31 +1630,43 @@ export const LocalWorkspacePage: React.FC<Props> = ({
         await revealFileLocation(res.proof_path);
         await loadTimeline(activeEpId);
       } else if (kind === 'colab_probe') {
-        const res = await api.post<{ gpu_tier: string; log: string }>(
+        const res = await api.post<{ async?: boolean; job_id?: number; gpu_tier?: string; log?: string }>(
           `/api/episodes/${activeEpId}/dispatch-colab`,
-          { gpu_tier: colabGpuTier, task_mode: 'probe_gpu' }
+          { gpu_tier: colabGpuTier, task_mode: 'probe_gpu', async_mode: true }
         );
-        notify(`Colab (${res.gpu_tier}) 云端 GPU 冒烟测通并已自动释放 VM！`);
-        await loadTimeline(activeEpId);
+        if (res.async || res.job_id) {
+          triggerAsyncJobsRefresh();
+          notify(`已派发 Colab (${colabGpuTier}) GPU 冒烟任务至后台队列，可在顶部面板追踪进度！`);
+        } else {
+          notify(`Colab (${res.gpu_tier || colabGpuTier}) 云端 GPU 冒烟测通并已自动释放 VM！`);
+          await loadTimeline(activeEpId);
+        }
       } else if (kind === 'colab_4k60') {
-        const res = await api.post<{ gpu_tier: string; mode: string; output_path: string; log: string }>(
+        const res = await api.post<{ async?: boolean; job_id?: number; gpu_tier?: string; mode?: string; output_path?: string; log?: string }>(
           `/api/episodes/${activeEpId}/dispatch-colab`,
           {
             gpu_tier: colabGpuTier,
             task_mode: colabTaskMode,
             hdr_hlg: colabHdrHlg,
             burn_subtitles: colabBurnSubtitles,
+            vo_sync_mode: localVoSyncMode,
+            async_mode: true,
           }
         );
-        const modeCn =
-          res.mode === 'upscale_4k_30fps'
-            ? `真 AI 4K/30fps ${colabHdrHlg ? '10-bit HLG HDR ' : ''}电影感母带`
-            : res.mode === 'ai_60fps_1080p'
-              ? '真 AI 1080p/60fps 补帧'
-              : `真 AI 4K/60fps ${colabHdrHlg ? 'HLG HDR ' : ''}母带`;
-        notify(`Colab (${res.gpu_tier}) ${modeCn}已完成并拉回本机，云端 GPU 已自动释放！`);
-        await loadTimeline(activeEpId);
-        await loadEpisodeShots(activeEpId);
+        if (res.async || res.job_id) {
+          triggerAsyncJobsRefresh();
+          notify(`已派发 Colab (${colabGpuTier}) 云端母带任务至后台队列，可随时在顶部任务队列查看进度或取消释放 GPU！`);
+        } else {
+          const modeCn =
+            res.mode === 'upscale_4k_30fps'
+              ? `真 AI 4K/30fps ${colabHdrHlg ? '10-bit HLG HDR ' : ''}电影感母带`
+              : res.mode === 'ai_60fps_1080p'
+                ? '真 AI 1080p/60fps 补帧'
+                : `真 AI 4K/60fps ${colabHdrHlg ? 'HLG HDR ' : ''}母带`;
+          notify(`Colab (${res.gpu_tier || colabGpuTier}) ${modeCn}已完成并拉回本机，云端 GPU 已自动释放！`);
+          await loadTimeline(activeEpId);
+          await loadEpisodeShots(activeEpId);
+        }
       } else if (kind === 'colab_pack') {
         const res = await api.post<{ manifest_path: string; rclone_cmd: string }>(
           `/api/episodes/${activeEpId}/export-colab-pack`
@@ -1921,6 +2043,17 @@ export const LocalWorkspacePage: React.FC<Props> = ({
         </div>
       </div>
 
+      {/* P0-3 轻量可折叠后台异步任务队列面板（支持 2 秒轮询、实时进度条、取消与刷新恢复） */}
+      <AsyncJobsPanel
+        episodeId={activeEpId}
+        shots={shots}
+        refreshSignal={asyncJobsRefreshTick}
+        onActiveJobsChange={setActiveAsyncJobs}
+        onJobCompleted={handleAsyncJobCompleted}
+        onRevealPath={revealFileLocation}
+        notify={notify}
+      />
+
       {/* ==================== Step 1: 季大纲与剧本 ==================== */}
       {step === 1 && (
         <div className="grid grid-cols-1 gap-5 xl:grid-cols-12">
@@ -2076,17 +2209,23 @@ export const LocalWorkspacePage: React.FC<Props> = ({
                     <div className="flex flex-wrap items-center gap-2">
                       <button
                         type="button"
-                        disabled={cliBusyKey !== null || !(epDraft.bgm_prompt || '').trim()}
+                        disabled={
+                          isKeyBusy('bgm') ||
+                          isEpJobActive(['cli_bgm', 'cli_generate_bgm']) ||
+                          !(epDraft.bgm_prompt || '').trim()
+                        }
                         onClick={handleCliGenerateBgm}
-                        title={`调用官方 gemini-api music (${cliMusicModel})，约 $${priceMusic.toFixed(2)}/首，生成后自动绑定到本集`}
+                        title={`生成原创配乐 (${cliMusicModel})，约 $${priceMusic.toFixed(2)}/首，后台异步执行并自动绑定到本集`}
                         className="inline-flex items-center gap-1 rounded bg-indigo-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-45 cursor-pointer"
                       >
-                        {cliBusyKey === 'bgm' ? (
+                        {isKeyBusy('bgm') || isEpJobActive(['cli_bgm', 'cli_generate_bgm']) ? (
                           <Loader2 className="h-3 w-3 animate-spin" />
                         ) : (
                           <Wand2 className="h-3 w-3" />
                         )}
-                        {cliBusyKey === 'bgm' ? 'CLI 生成配乐中...' : `CLI 一键生成配乐 (${cliMusicModel} · $${priceMusic.toFixed(2)})`}
+                        {isKeyBusy('bgm') || isEpJobActive(['cli_bgm', 'cli_generate_bgm'])
+                          ? '后台生成配乐中...'
+                          : `一键生成配乐 (${cliMusicModel} · $${priceMusic.toFixed(2)})`}
                       </button>
                       {epDraft.bgm_prompt && (
                         <button
@@ -2332,17 +2471,17 @@ export const LocalWorkspacePage: React.FC<Props> = ({
                         {box.slot === 'clean' && (
                           <button
                             type="button"
-                            disabled={cliBusyKey !== null}
+                            disabled={isKeyBusy(`asset-${a.id}`)}
                             onClick={() => handleCliGenerateAssetClean(a, 'portrait')}
-                            title={`调用官方 gemini-api image (${cliImageModel} · ${cliImageSize} · ${cliImageCount}张)，自动带入原图做棚拍洗图`}
+                            title={`调用 SDK/CLI 生成棚拍定妆图 (${cliImageModel} · ${cliImageSize} · ${cliImageCount}张)，自动带入原图做棚拍洗图`}
                             className="w-full inline-flex items-center justify-center gap-1 rounded bg-indigo-600 py-1 text-[10px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-45 cursor-pointer"
                           >
-                            {cliBusyKey === `asset-${a.id}` ? (
+                            {isKeyBusy(`asset-${a.id}`) ? (
                               <Loader2 className="h-2.5 w-2.5 animate-spin" />
                             ) : (
                               <Wand2 className="h-2.5 w-2.5" />
                             )}
-                            {cliBusyKey === `asset-${a.id}` ? 'CLI 洗图中...' : `CLI 棚拍洗图 (${cliImageSize}×${cliImageCount})`}
+                            {isKeyBusy(`asset-${a.id}`) ? '棚拍洗图中...' : `一键棚拍洗图 (${cliImageSize}×${cliImageCount})`}
                           </button>
                         )}
                         {box.slot === 'clean' && inboxImages.length > 0 && (
@@ -2398,7 +2537,7 @@ export const LocalWorkspacePage: React.FC<Props> = ({
                             <img src={mediaUrl(c.path)} alt={c.filename} className="h-28 w-full rounded object-contain bg-slate-900" />
                             <button
                               type="button"
-                              disabled={cliBusyKey !== null}
+                              disabled={isKeyBusy(`asset-pick-${a.id}`)}
                               onClick={() => handleSelectAssetCandidate(a, c)}
                               className="w-full rounded bg-indigo-600 py-1 text-[10px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-45 cursor-pointer"
                             >
@@ -2560,6 +2699,16 @@ export const LocalWorkspacePage: React.FC<Props> = ({
                 >
                   <Plus className="h-3.5 w-3.5" /> 手动加一镜
                 </button>
+                <FramesSheetTool
+                  episodeId={activeEpId}
+                  episode={activeEp}
+                  shots={shots}
+                  onUpdated={async () => {
+                    if (activeEpId) await loadEpisodeShots(activeEpId, { silent: true });
+                  }}
+                  onRevealPath={revealFileLocation}
+                  notify={notify}
+                />
               </div>
 
               <div className="flex items-center gap-1.5 rounded-lg bg-slate-100 p-1 border border-slate-200">
@@ -2787,17 +2936,24 @@ export const LocalWorkspacePage: React.FC<Props> = ({
                       <div className="flex flex-wrap gap-1.5">
                         <button
                           type="button"
-                          disabled={cliBusyKey !== null}
+                          disabled={
+                            isKeyBusy(`frame-${s.id}-start_frame`) ||
+                            isShotJobActive(s.id, ['cli_frame', 'cli_generate_frame'])
+                          }
                           onClick={() => handleCliGenerateShotFrame(s, 'start_frame')}
-                          title={`调用官方 gemini-api image (${cliImageModel} · ${cliImageSize} · ${cliImageCount}张)，自动挂载本镜绑定资产参考图`}
+                          title={`生成首帧 (${cliImageModel} · ${cliImageSize} · ${cliImageCount}张)，自动挂载本镜绑定资产参考图，支持多镜并发`}
                           className="inline-flex items-center justify-center gap-1 rounded-lg bg-indigo-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-indigo-700 disabled:opacity-45 cursor-pointer"
                         >
-                          {cliBusyKey === `frame-${s.id}-start_frame` ? (
+                          {isKeyBusy(`frame-${s.id}-start_frame`) ||
+                          isShotJobActive(s.id, ['cli_frame', 'cli_generate_frame']) ? (
                             <Loader2 className="h-3 w-3 animate-spin" />
                           ) : (
                             <Wand2 className="h-3 w-3" />
                           )}
-                          {cliBusyKey === `frame-${s.id}-start_frame` ? 'CLI 出图中...' : 'CLI 生首帧'}
+                          {isKeyBusy(`frame-${s.id}-start_frame`) ||
+                          isShotJobActive(s.id, ['cli_frame', 'cli_generate_frame'])
+                            ? '后台出图中...'
+                            : '一键生首帧'}
                         </button>
                         <button
                           onClick={async () => {
@@ -2836,17 +2992,17 @@ export const LocalWorkspacePage: React.FC<Props> = ({
                           <div className="flex flex-wrap gap-1.5">
                             <button
                               type="button"
-                              disabled={cliBusyKey !== null || !endPromptToCopy}
+                              disabled={isKeyBusy(`frame-${s.id}-end_frame`) || !endPromptToCopy}
                               onClick={() => handleCliGenerateShotFrame(s, 'end_frame')}
-                              title={endPromptToCopy ? `调用官方 CLI 自动挂载首帧+资产生成尾帧 (${cliImageSize}×${cliImageCount})` : '请先点「编辑本镜」填写尾帧英文 Prompt'}
+                              title={endPromptToCopy ? `自动挂载首帧+资产后台生成尾帧 (${cliImageSize}×${cliImageCount})` : '请先点「编辑本镜」填写尾帧英文 Prompt'}
                               className="inline-flex items-center justify-center gap-1 rounded-lg bg-violet-600 px-2.5 py-1.5 text-[11px] font-semibold text-white hover:bg-violet-700 disabled:opacity-45 cursor-pointer"
                             >
-                              {cliBusyKey === `frame-${s.id}-end_frame` ? (
+                              {isKeyBusy(`frame-${s.id}-end_frame`) ? (
                                 <Loader2 className="h-3 w-3 animate-spin" />
                               ) : (
                                 <Wand2 className="h-3 w-3" />
                               )}
-                              {cliBusyKey === `frame-${s.id}-end_frame` ? 'CLI 出尾帧...' : 'CLI 生尾帧'}
+                              {isKeyBusy(`frame-${s.id}-end_frame`) ? '提交尾帧中...' : '一键生尾帧'}
                             </button>
                             <button
                               type="button"
@@ -3190,49 +3346,58 @@ export const LocalWorkspacePage: React.FC<Props> = ({
                       <div className="flex flex-wrap items-center gap-1.5">
                         <button
                           type="button"
-                          disabled={cliBusyKey !== null}
+                          disabled={
+                            isKeyBusy(`frame-${activeShot.id}-start_frame`) ||
+                            isShotJobActive(activeShot.id, ['cli_frame', 'cli_generate_frame'])
+                          }
                           onClick={() => handleCliGenerateShotFrame(activeShot, 'start_frame')}
                           className="inline-flex items-center gap-1 rounded-md border border-indigo-200 bg-white px-2.5 py-1 text-[11px] font-medium text-indigo-700 hover:bg-indigo-600 hover:text-white disabled:opacity-45 cursor-pointer"
                         >
-                          {cliBusyKey === `frame-${activeShot.id}-start_frame` ? (
+                          {isKeyBusy(`frame-${activeShot.id}-start_frame`) ||
+                          isShotJobActive(activeShot.id, ['cli_frame', 'cli_generate_frame']) ? (
                             <Loader2 className="h-3 w-3 animate-spin" />
                           ) : (
                             <Wand2 className="h-3 w-3" />
                           )}
-                          CLI 生首帧
+                          一键生首帧
                         </button>
                         {hasEndFrameFeature(activeShot) && (
                           <button
                             type="button"
                             disabled={
-                              cliBusyKey !== null ||
+                              isKeyBusy(`frame-${activeShot.id}-end_frame`) ||
                               !(activeShot.compiled.compiled_end_frame_prompt || activeShot.end_frame_prompt_en)
                             }
                             onClick={() => handleCliGenerateShotFrame(activeShot, 'end_frame')}
                             className="inline-flex items-center gap-1 rounded-md border border-violet-200 bg-white px-2.5 py-1 text-[11px] font-medium text-violet-700 hover:bg-violet-600 hover:text-white disabled:opacity-45 cursor-pointer"
                           >
-                            {cliBusyKey === `frame-${activeShot.id}-end_frame` ? (
+                            {isKeyBusy(`frame-${activeShot.id}-end_frame`) ? (
                               <Loader2 className="h-3 w-3 animate-spin" />
                             ) : (
                               <Wand2 className="h-3 w-3" />
                             )}
-                            CLI 生尾帧
+                            一键生尾帧
                           </button>
                         )}
                         <button
                           type="button"
-                          disabled={cliBusyKey !== null}
+                          disabled={
+                            isKeyBusy(`video-${activeShot.id}`) ||
+                            isShotJobActive(activeShot.id, ['cli_video', 'cli_generate_video'])
+                          }
                           onClick={() => handleCliGenerateShotVideo(activeShot)}
                           className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1 text-[11px] font-semibold text-white hover:bg-emerald-700 disabled:opacity-45 cursor-pointer shadow-2xs"
                         >
-                          {cliBusyKey === `video-${activeShot.id}` ? (
+                          {isKeyBusy(`video-${activeShot.id}`) ||
+                          isShotJobActive(activeShot.id, ['cli_video', 'cli_generate_video']) ? (
                             <Loader2 className="h-3.5 w-3.5 animate-spin" />
                           ) : (
                             <Film className="h-3.5 w-3.5" />
                           )}
-                          {cliBusyKey === `video-${activeShot.id}`
-                            ? `${cliVideoModel} (${cliVideoRes}) 生成轮询中...`
-                            : `CLI 自动生视频 (${cliVideoRes}×${cliVideoCount} · $${estimateCliVideoCost(activeShot.duration_sec)})`}
+                          {isKeyBusy(`video-${activeShot.id}`) ||
+                          isShotJobActive(activeShot.id, ['cli_video', 'cli_generate_video'])
+                            ? `${cliVideoModel} (${cliVideoRes}) 后台生成中...`
+                            : `一键自动生视频 (${cliVideoRes}×${cliVideoCount} · $${estimateCliVideoCost(activeShot.duration_sec)})`}
                         </button>
                       </div>
                     </div>
@@ -3621,9 +3786,43 @@ export const LocalWorkspacePage: React.FC<Props> = ({
         </div>
       )}
 
-      {/* ==================== Step 5: 连播时间线预演 ==================== */}
+      {/* ==================== Step 5: 连播时间线预演 + 视频音画体检 + 三轨配音区 ==================== */}
       {step === 5 && (
-        <div className="grid grid-cols-1 gap-5 xl:grid-cols-12">
+        <div className="space-y-5">
+          {/* P0-4 视频体检区：3 帧 + 音轨幻觉体检 */}
+          <VideoQcInspectTool
+            episodeId={activeEpId}
+            episode={activeEp}
+            shots={shots}
+            onUpdated={async () => {
+              if (activeEpId) {
+                await loadEpisodeShots(activeEpId, { silent: true });
+                await loadTimeline(activeEpId);
+              }
+            }}
+            onRevealPath={revealFileLocation}
+            notify={notify}
+          />
+
+          {/* P0-4 三轨配音区：批量中文 TTS 旁白 + 每镜干声试听/上传/切纯字幕 */}
+          <BatchTtsAndVoPanel
+            episodeId={activeEpId}
+            episode={activeEp}
+            shots={shots}
+            ttsModelName={cliTtsModel}
+            ttsPricePerShot={priceTts}
+            activeTtsRunning={isEpJobActive(['cli_tts', 'cli_generate_tts'])}
+            onJobSubmitted={() => triggerAsyncJobsRefresh()}
+            onUpdated={async () => {
+              if (activeEpId) {
+                await loadEpisodeShots(activeEpId, { silent: true });
+                await loadTimeline(activeEpId);
+              }
+            }}
+            notify={notify}
+          />
+
+          <div className="grid grid-cols-1 gap-5 xl:grid-cols-12">
           <div className="xl:col-span-5 studio-card rounded-2xl p-4 flex flex-col items-center space-y-3">
             <div className="w-full flex items-center justify-between text-xs">
               <span className="font-semibold text-slate-900">整集连播预演器</span>
@@ -3753,6 +3952,7 @@ export const LocalWorkspacePage: React.FC<Props> = ({
                 );
               })}
             </div>
+          </div>
           </div>
         </div>
       )}
@@ -3935,6 +4135,19 @@ export const LocalWorkspacePage: React.FC<Props> = ({
                     烧录黄金安全区字幕
                   </label>
                 </div>
+                <div className="pt-1.5 space-y-1 text-xs">
+                  <label className="block text-[11px] font-medium text-slate-600">
+                    VO 超长对齐方式（vo_sync_mode）
+                  </label>
+                  <select
+                    value={localVoSyncMode}
+                    onChange={(e) => setLocalVoSyncMode(e.target.value as 'pad' | 'speed')}
+                    className="studio-input w-full rounded-lg px-2.5 py-1.5 text-xs"
+                  >
+                    <option value="pad">尾帧自动定格对齐 (pad · 推荐，绝不截断旁白)</option>
+                    <option value="speed">微加速对齐 (speed · 最高 1.2x 贴合原镜)</option>
+                  </select>
+                </div>
               </div>
               <div className="space-y-2">
                 <button
@@ -4014,11 +4227,17 @@ export const LocalWorkspacePage: React.FC<Props> = ({
                   <button
                     type="button"
                     onClick={handleGenerateCovers}
-                    disabled={coverBusy || !activeEpId}
+                    disabled={coverBusy || isEpJobActive(['cli_covers', 'cli_generate_covers']) || !activeEpId}
                     className="inline-flex items-center gap-1.5 rounded-lg bg-violet-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-violet-700 disabled:opacity-45 cursor-pointer"
                   >
-                    {coverBusy ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
-                    {coverBusy ? 'CLI 生封面中...' : `一键生成双比例封面 (~$${(priceImg2K * 4).toFixed(2)})`}
+                    {coverBusy || isEpJobActive(['cli_covers', 'cli_generate_covers']) ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : (
+                      <Sparkles className="h-3.5 w-3.5" />
+                    )}
+                    {coverBusy || isEpJobActive(['cli_covers', 'cli_generate_covers'])
+                      ? '后台生成封面中...'
+                      : `一键生成双比例封面 (~$${(priceImg2K * 4).toFixed(2)})`}
                   </button>
                 </div>
               </div>

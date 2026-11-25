@@ -21,10 +21,11 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import EXPORTS_DIR, load_config
-from .media_ops import build_master_base_mp4
+from .jobs import JobCancelledError
+from .media_ops import build_master_base_mp4, export_srt
 
 VALID_GPU_TIERS = ("CPU", "T4", "L4", "G4", "A100", "H100")
 
@@ -515,28 +516,146 @@ def _gpu_fallback_chain(primary: str) -> list[str]:
     return chains.get(primary, [primary, "L4", "T4"])
 
 
-def _allocate_colab_session(cli: str, session_name: str, primary_tier: str, env: dict[str, str]) -> tuple[str, list[str]]:
+def _emit_progress(
+    progress_cb: Callable[..., Any] | None,
+    progress_pct: int,
+    stage_msg: str,
+    log_line: str | None = None,
+) -> None:
+    """安全触发进度回调（同时兼容 JobContext.update 关键字签名与双参回调）"""
+    if progress_cb is None:
+        return
+    try:
+        progress_cb(progress_pct=progress_pct, stage_msg=stage_msg, log_line=log_line)
+    except TypeError:
+        try:
+            progress_cb(progress_pct, stage_msg)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+
+def _check_cancelled(cancel_check: Callable[[], Any] | None) -> None:
+    """检查取消信号：若回调返回真值或主动抛 JobCancelledError，则立即中止 Colab 等待"""
+    if cancel_check is None:
+        return
+    if cancel_check():
+        raise JobCancelledError("Colab 云端任务已取消，正在自动释放云端 GPU")
+
+
+def _run_cancellable_subprocess(
+    cmd: list[str],
+    *,
+    timeout: float,
+    env: dict[str, str],
+    cancel_check: Callable[[], Any] | None = None,
+    poll_interval: float = 0.5,
+) -> subprocess.CompletedProcess[str]:
+    """支持在等待期间每 0.5 秒检查取消信号的子进程执行器，取消时立刻终止进程"""
+    _check_cancelled(cancel_check)
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    out_chunks: list[str] = []
+    err_chunks: list[str] = []
+
+    def _drain(pipe: Any, sink: list[str]) -> None:
+        if pipe is None:
+            return
+        try:
+            sink.append(pipe.read() or "")
+        except Exception:
+            pass
+        finally:
+            try:
+                pipe.close()
+            except Exception:
+                pass
+
+    t_out = threading.Thread(target=_drain, args=(proc.stdout, out_chunks), daemon=True)
+    t_err = threading.Thread(target=_drain, args=(proc.stderr, err_chunks), daemon=True)
+    t_out.start()
+    t_err.start()
+
+    deadline = time.monotonic() + max(1.0, float(timeout))
+    try:
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                break
+            _check_cancelled(cancel_check)
+            if time.monotonic() >= deadline:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                raise subprocess.TimeoutExpired(cmd, timeout, output="".join(out_chunks), stderr="".join(err_chunks))
+            time.sleep(poll_interval)
+    except BaseException:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        raise
+    finally:
+        t_out.join(timeout=2.0)
+        t_err.join(timeout=2.0)
+
+    return subprocess.CompletedProcess(
+        args=cmd,
+        returncode=int(proc.returncode if proc.returncode is not None else -1),
+        stdout="".join(out_chunks),
+        stderr="".join(err_chunks),
+    )
+
+
+def _sleep_cancellable(seconds: float, cancel_check: Callable[[], Any] | None = None) -> None:
+    end = time.monotonic() + max(0.0, float(seconds))
+    while time.monotonic() < end:
+        _check_cancelled(cancel_check)
+        time.sleep(min(0.3, max(0.05, end - time.monotonic())))
+
+
+def _allocate_colab_session(
+    cli: str,
+    session_name: str,
+    primary_tier: str,
+    env: dict[str, str],
+    *,
+    progress_cb: Callable[..., Any] | None = None,
+    cancel_check: Callable[[], Any] | None = None,
+) -> tuple[str, list[str]]:
     """按降级链尝试分配 Colab 运行时，返回 (实际分配到的卡型, 分配日志)"""
     notes: list[str] = []
     last_err = ""
-    for tier in _gpu_fallback_chain(primary_tier):
+    chain = _gpu_fallback_chain(primary_tier)
+    for tier in chain:
+        _check_cancelled(cancel_check)
+        _emit_progress(progress_cb, 28, f"正在向 Colab 申请 {tier} 运行时...")
         gpu_args = ["--gpu", tier] if tier != "CPU" else []
-        r_new = subprocess.run(
+        r_new = _run_cancellable_subprocess(
             [cli, "--auth=oauth2", "new", "-s", session_name, *gpu_args],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
             timeout=180,
             env=env,
+            cancel_check=cancel_check,
         )
         if r_new.returncode == 0:
-            time.sleep(3)
+            _sleep_cancellable(3.0, cancel_check=cancel_check)
             if tier != primary_tier:
                 notes.append(f"提示：{primary_tier} 当前高峰紧张，已自动防排队降级至 {tier} 并分配成功")
             return tier, notes
         last_err = (r_new.stderr or r_new.stdout or f"exit {r_new.returncode}").strip()[-300:]
         notes.append(f"尝试 {tier} 未分配（{last_err[:120]}），自动尝试下一档...")
-    raise RuntimeError(f"Colab GPU 分配失败（已尝试降级链 {_gpu_fallback_chain(primary_tier)}）：\n{last_err}")
+    raise RuntimeError(f"Colab GPU 分配失败（已尝试降级链 {chain}）：\n{last_err}")
 
 
 def dispatch_episode_to_colab(
@@ -548,6 +667,9 @@ def dispatch_episode_to_colab(
     task_mode: str = "upscale_4k_30fps",
     burn_subtitles: bool = True,
     hdr_hlg: bool = True,
+    vo_sync_mode: str = "pad",
+    progress_cb: Callable[..., Any] | None = None,
+    cancel_check: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     """
     通过官方 google-colab-cli 派发任务至 Google Colab 云端 GPU（默认 L4 防排队 + 自动降级）：
@@ -555,8 +677,10 @@ def dispatch_episode_to_colab(
     - task_mode == 'upscale_4k_30fps'（推荐默认）：Real-ESRGAN v3 4K 超分 + 保留源帧率电影感 + 可选 10-bit HLG HDR + 安全区字幕；
     - task_mode == 'upscale_4k_60fps'：Real-ESRGAN v3 4K 超分 + RIFE v4.26 60fps 补帧 + 可选 10-bit HLG HDR；
     - task_mode == 'ai_60fps_1080p'：RIFE v4.26 60fps 补帧（保持 1080p）；
-    任务结束无论成功与否均在 finally 中强制 `colab stop` 释放 VM。
+    支持可选 progress_cb / cancel_check 回调；任务结束无论成功、失败或取消均在 finally 中强制 `colab stop` 释放 VM。
     """
+    _check_cancelled(cancel_check)
+    _emit_progress(progress_cb, 5, "正在校验 Colab CLI 与 OAuth2 授权状态...")
     cli = resolve_colab_cli()
     if not cli:
         raise RuntimeError("未检测到官方 colab CLI，请先安装 google-colab-cli。")
@@ -565,6 +689,7 @@ def dispatch_episode_to_colab(
     if not status.get("authorized"):
         raise RuntimeError("尚未完成 Google Colab 官方 OAuth2 授权。请先前往「系统设置」完成授权后再派发。")
 
+    _check_cancelled(cancel_check)
     requested_tier = _normalize_gpu_tier(gpu_tier)
     env = _build_google_env()
     session_name = f"agvs_{uuid.uuid4().hex[:6]}"
@@ -599,21 +724,28 @@ if ff:
         with tempfile.NamedTemporaryFile("w", suffix="_colab_probe.py", delete=False, encoding="utf-8") as tf:
             tf.write(probe_script)
             script_path = Path(tf.name)
-        created = False
+        may_have_session = False
         try:
-            actual_tier, alloc_notes = _allocate_colab_session(cli, session_name, requested_tier, env)
-            created = True
-            res = subprocess.run(
+            may_have_session = True
+            actual_tier, alloc_notes = _allocate_colab_session(
+                cli,
+                session_name,
+                requested_tier,
+                env,
+                progress_cb=progress_cb,
+                cancel_check=cancel_check,
+            )
+            _emit_progress(progress_cb, 60, f"已分配 {actual_tier}，正在执行云端环境冒烟自检...")
+            res = _run_cancellable_subprocess(
                 [cli, "--auth=oauth2", "exec", "-s", session_name, "--timeout", "180", "-f", str(script_path)],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
                 timeout=240,
                 env=env,
+                cancel_check=cancel_check,
             )
             if res.returncode != 0:
                 raise RuntimeError(f"Colab GPU 冒烟测试失败：\n{(res.stderr or res.stdout)[-800:]}")
             log_lines = [*alloc_notes, res.stdout.strip() or f"Colab {actual_tier} 运行时自检通过并已自动释放 VM"]
+            _emit_progress(progress_cb, 95, "冒烟自检完成，正在自动释放云端 GPU...")
             return {
                 "mode": "probe_gpu",
                 "gpu_tier": actual_tier,
@@ -621,7 +753,7 @@ if ff:
                 "log": "\n".join(x for x in log_lines if x),
             }
         finally:
-            if created:
+            if may_have_session:
                 subprocess.run([cli, "--auth=oauth2", "stop", "-s", session_name], capture_output=True, text=True, timeout=45, env=env)
             try:
                 script_path.unlink(missing_ok=True)
@@ -639,11 +771,15 @@ if ff:
         raise RuntimeError(f"缺少 Colab AI 引擎脚本：{master_script}")
 
     # 1. 本地构造真 1080p + 完整三轨音频基准片（字幕与 HLG 交由 Colab 4K 超分后原生烧录与 10-bit 封装）
+    _check_cancelled(cancel_check)
+    _emit_progress(progress_cb, 15, "正在本地封装 1080p 三轨音频基准片（含 VO 精准对齐）...")
     out_dir = EXPORTS_DIR / f"{project['slug']}_ep{episode['ep_number']:02d}"
     out_dir.mkdir(parents=True, exist_ok=True)
     tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_mp4 = out_dir / f"_colab_input_{tag}.mp4"
     bgm_vol = float(episode.get("bgm_volume") if episode.get("bgm_volume") is not None else 0.25)
+    if burn_subtitles:
+        export_srt(timeline_items, srt_path, vo_sync_mode=vo_sync_mode)
     build_master_base_mp4(
         timeline_items,
         base_mp4,
@@ -651,6 +787,7 @@ if ff:
         bgm_volume=bgm_vol,
         hdr_hlg=False,
         burn_srt_path=None,
+        vo_sync_mode=vo_sync_mode,
     )
 
     mode_label_map = {
@@ -660,54 +797,60 @@ if ff:
     }
     mode_label = mode_label_map[task_mode] + ("_HLG" if hdr_hlg else "")
     target_fps = 30 if task_mode == "upscale_4k_30fps" else 60
-    created = False
+    may_have_session = False
     logs: list[str] = []
     try:
-        actual_tier, alloc_notes = _allocate_colab_session(cli, session_name, requested_tier, env)
-        created = True
+        _check_cancelled(cancel_check)
+        may_have_session = True
+        actual_tier, alloc_notes = _allocate_colab_session(
+            cli,
+            session_name,
+            requested_tier,
+            env,
+            progress_cb=progress_cb,
+            cancel_check=cancel_check,
+        )
         logs.extend(alloc_notes)
-        logs.append(f"[1/5] 已分配 Colab {actual_tier} 会话 ({session_name}) · 模式：{mode_label}")
+        msg_alloc = f"[1/5] 已分配 Colab {actual_tier} 会话 ({session_name}) · 模式：{mode_label}"
+        logs.append(msg_alloc)
+        _emit_progress(progress_cb, 35, f"已分配 Colab {actual_tier}，正在上传基准片与 AI 脚本...", log_line=msg_alloc)
         final_local_mp4 = out_dir / f"{project['name']}_E{episode['ep_number']:02d}_Colab_{actual_tier}_{mode_label}_{tag}.mp4"
 
-        r_up_vid = subprocess.run(
+        r_up_vid = _run_cancellable_subprocess(
             [cli, "--auth=oauth2", "upload", "-s", session_name, str(base_mp4), "/content/input_master.mp4"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
             timeout=300,
             env=env,
+            cancel_check=cancel_check,
         )
         if r_up_vid.returncode != 0:
             raise RuntimeError(f"上传基准成片到 Colab 失败：\n{(r_up_vid.stderr or r_up_vid.stdout)[-600:]}")
 
-        r_up_py = subprocess.run(
+        r_up_py = _run_cancellable_subprocess(
             [cli, "--auth=oauth2", "upload", "-s", session_name, str(master_script), "/content/colab_ai_master.py"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
             timeout=60,
             env=env,
+            cancel_check=cancel_check,
         )
         if r_up_py.returncode != 0:
             raise RuntimeError(f"上传 AI 处理脚本到 Colab 失败：\n{(r_up_py.stderr or r_up_py.stdout)[-400:]}")
 
         remote_srt = ""
         if burn_subtitles and srt_path.exists() and srt_path.stat().st_size > 10:
-            r_up_srt = subprocess.run(
+            r_up_srt = _run_cancellable_subprocess(
                 [cli, "--auth=oauth2", "upload", "-s", session_name, str(srt_path), "/content/subtitles.srt"],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
                 timeout=60,
                 env=env,
+                cancel_check=cancel_check,
             )
             if r_up_srt.returncode == 0:
                 remote_srt = "/content/subtitles.srt"
 
-        logs.append(
+        msg_up = (
             f"[2/5] 已上传真 1080p 三轨基准成片（{round(base_mp4.stat().st_size / (1024 * 1024), 1)} MB）与云端 AI 引擎"
             + (" + 黄金安全区中文字幕" if remote_srt else "")
         )
+        logs.append(msg_up)
+        _emit_progress(progress_cb, 50, "上传完成，即将启动云端 GPU AI 增强...", log_line=msg_up)
 
         runner_code = (
             "import sys\n"
@@ -736,14 +879,14 @@ if ff:
                 "ai_60fps_1080p": "RIFE v4.26 60fps 补帧",
             }
             hdr_note = " + 10-bit HLG HDR 封装" if hdr_hlg else ""
-            logs.append(f"[3/5] 正在云端 GPU 运行 {step_desc_map[task_mode]}{hdr_note}...")
-            r_exec = subprocess.run(
+            msg_exec = f"[3/5] 正在云端 GPU 运行 {step_desc_map[task_mode]}{hdr_note}..."
+            logs.append(msg_exec)
+            _emit_progress(progress_cb, 58, f"云端 {actual_tier} 正在执行 {step_desc_map[task_mode]}...", log_line=msg_exec)
+            r_exec = _run_cancellable_subprocess(
                 [cli, "--auth=oauth2", "exec", "-s", session_name, "--timeout", "600", "-f", str(runner_path)],
-                stdin=subprocess.DEVNULL,
-                capture_output=True,
-                text=True,
                 timeout=3600,
                 env=env,
+                cancel_check=cancel_check,
             )
         finally:
             try:
@@ -754,30 +897,33 @@ if ff:
         exec_out = (r_exec.stdout or "").strip()
         if r_exec.returncode != 0 or "[AI Master] DONE!" not in exec_out:
             raise RuntimeError(f"Colab 云端 AI 母带处理失败：\n{(r_exec.stderr or exec_out)[-1000:]}")
-        logs.append(f"[4/5] 云端 GPU AI 增强完成：\n{exec_out[-500:]}")
+        msg_done_exec = f"[4/5] 云端 GPU AI 增强完成：\n{exec_out[-500:]}"
+        logs.append(msg_done_exec)
+        _emit_progress(progress_cb, 86, "云端 AI 增强完成，正在拉回成品母带...", log_line=msg_done_exec)
 
-        r_dl = subprocess.run(
+        r_dl = _run_cancellable_subprocess(
             [cli, "--auth=oauth2", "download", "-s", session_name, "/content/output_master.mp4", str(final_local_mp4)],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
             timeout=360,
             env=env,
+            cancel_check=cancel_check,
         )
         if r_dl.returncode != 0 or not final_local_mp4.exists():
             raise RuntimeError(f"从 Colab 下载 AI 成片失败：\n{(r_dl.stderr or r_dl.stdout)[-600:]}")
-        logs.append(f"[5/5] 已拉回母带至本机：{final_local_mp4.name}（自动释放云端 GPU 中）")
+        msg_dl = f"[5/5] 已拉回母带至本机：{final_local_mp4.name}（自动释放云端 GPU 中）"
+        logs.append(msg_dl)
+        _emit_progress(progress_cb, 96, "母带已拉回本机，正在自动释放云端 GPU...", log_line=msg_dl)
 
         return {
             "mode": task_mode,
             "hdr_hlg": bool(hdr_hlg),
             "gpu_tier": actual_tier,
+            "vo_sync_mode": vo_sync_mode,
             "output_path": str(final_local_mp4.resolve()),
             "srt_path": str(srt_path.resolve()),
             "log": "\n".join(logs),
         }
     finally:
-        if created:
+        if may_have_session:
             subprocess.run(
                 [cli, "--auth=oauth2", "stop", "-s", session_name],
                 capture_output=True,

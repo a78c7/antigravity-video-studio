@@ -9,16 +9,20 @@
 
 from __future__ import annotations
 
+import importlib.util
 import os
+import shutil
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
+from . import config as app_config
 from .auth import (
     LOCAL_DEFAULT_ACTOR,
     SESSION_COOKIE_NAME,
@@ -37,7 +41,13 @@ from .config import (
     load_config,
 )
 from .db import init_db
+from .jobs import recover_stale_jobs_on_startup
 from .routers import analytics, collab, delivery, studio, topics
+from .worker_colab import resolve_colab_cli
+
+APP_VERSION = "1.0.1"
+_HEALTH_CACHE_TTL_SEC = 30.0
+_health_env_cache: dict[str, Any] = {"ts": 0.0, "data_dir": "", "values": None}
 
 try:
     from .watcher import downloads_inbox
@@ -52,6 +62,7 @@ _CLOUD_BLOCKED_PREFIXES: tuple[str, ...] = (
     "/openapi.json",
     "/api/quota",
     "/api/inbox",
+    "/api/jobs",
     "/api/settings/probe-colab",
     "/api/settings/colab",
     "/api/settings/gemini-models",
@@ -98,6 +109,7 @@ def _is_cloud_blocked_path(path: str) -> bool:
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     init_db()
+    recover_stale_jobs_on_startup()
     absorb_fn = getattr(topics, "absorb_offline_campaigns_inbox", None)
     if callable(absorb_fn):
         absorb_fn()
@@ -117,7 +129,7 @@ _agvs_port = (os.environ.get("AGVS_PORT") or "8765").strip() or "8765"
 
 app = FastAPI(
     title=f"{DEFAULT_BRAND_NAME} · AI 短剧全流程制片台",
-    version="1.0.0",
+    version=APP_VERSION,
     lifespan=lifespan,
     docs_url=None if _cloud_mode_at_boot else "/docs",
     redoc_url=None if _cloud_mode_at_boot else "/redoc",
@@ -233,16 +245,111 @@ if not is_cloud_collab():
         pass
 
 
+def _probe_google_genai_sdk_ok() -> bool:
+    fn = getattr(app_config, "is_google_genai_sdk_available", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+    try:
+        return importlib.util.find_spec("google.genai") is not None
+    except Exception:
+        return False
+
+
+def _probe_gemini_cli_ok() -> bool:
+    fn = getattr(app_config, "is_gemini_cli_available", None)
+    if callable(fn):
+        try:
+            return bool(fn())
+        except Exception:
+            return False
+    return bool(shutil.which("gemini-api") or shutil.which("gemini-api.exe"))
+
+
+def _get_cached_env_health(*, include_google_tools: bool) -> dict[str, Any]:
+    """轻量缓存本机环境红绿灯体检（30s TTL），避免高频轮询反复探测子进程"""
+    now = time.monotonic()
+    data_dir_str = str(app_config.DATA_DIR)
+    cached_vals = _health_env_cache.get("values")
+    if (
+        isinstance(cached_vals, dict)
+        and _health_env_cache.get("data_dir") == data_dir_str
+        and (now - float(_health_env_cache.get("ts") or 0.0)) < _HEALTH_CACHE_TTL_SEC
+        and (not include_google_tools or "google_genai_sdk_ok" in cached_vals)
+    ):
+        base = dict(cached_vals)
+    else:
+        ffmpeg_ok = bool(shutil.which("ffmpeg"))
+        ffprobe_ok = bool(shutil.which("ffprobe"))
+        try:
+            usage = shutil.disk_usage(data_dir_str if Path(data_dir_str).exists() else str(Path(data_dir_str).parent))
+            disk_free_gb = round(usage.free / (1024 ** 3), 2)
+        except Exception:
+            disk_free_gb = 0.0
+
+        has_non_ascii = any(ord(ch) > 127 for ch in data_dir_str)
+        has_space = " " in data_dir_str
+        if has_space or has_non_ascii:
+            path_warning = (
+                "当前数据目录路径包含空格或中文/非 ASCII 字符，部分视频滤镜在 Windows 下可能受影响；"
+                "建议设置环境变量 STUDIO_DATA_DIR 为纯英文无空格路径。"
+            )
+        else:
+            path_warning = ""
+
+        base = {
+            "ffmpeg_ok": ffmpeg_ok,
+            "ffprobe_ok": ffprobe_ok,
+            "disk_free_gb": disk_free_gb,
+            "path_warning": path_warning,
+        }
+        if include_google_tools:
+            base["google_genai_sdk_ok"] = _probe_google_genai_sdk_ok()
+            base["gemini_cli_ok"] = _probe_gemini_cli_ok()
+            try:
+                base["colab_cli_ok"] = bool(resolve_colab_cli())
+            except Exception:
+                base["colab_cli_ok"] = False
+
+        _health_env_cache["ts"] = now
+        _health_env_cache["data_dir"] = data_dir_str
+        _health_env_cache["values"] = dict(base)
+
+    if not include_google_tools:
+        return {
+            "ffmpeg_ok": base["ffmpeg_ok"],
+            "ffprobe_ok": base["ffprobe_ok"],
+            "disk_free_gb": base["disk_free_gb"],
+            "path_warning": base["path_warning"],
+        }
+    return base
+
+
 @app.get("/api/health")
-def health() -> dict[str, str]:
+def health() -> dict[str, Any]:
     cfg = load_config()
     brand_name = (cfg.get("BRAND_NAME") or DEFAULT_BRAND_NAME).strip() or DEFAULT_BRAND_NAME
-    return {
+    app_mode = get_app_mode(cfg)
+    cloud_mode = app_mode == "cloud_collab"
+    env_health = _get_cached_env_health(include_google_tools=not cloud_mode)
+    payload: dict[str, Any] = {
         "status": "ok",
         "app": APP_PACKAGE_NAME,
+        "version": APP_VERSION,
         "brand_name": brand_name,
-        "app_mode": get_app_mode(cfg),
+        "app_mode": app_mode,
+        "ffmpeg_ok": env_health["ffmpeg_ok"],
+        "ffprobe_ok": env_health["ffprobe_ok"],
+        "disk_free_gb": env_health["disk_free_gb"],
+        "path_warning": env_health["path_warning"],
     }
+    if not cloud_mode:
+        payload["google_genai_sdk_ok"] = env_health["google_genai_sdk_ok"]
+        payload["gemini_cli_ok"] = env_health["gemini_cli_ok"]
+        payload["colab_cli_ok"] = env_health["colab_cli_ok"]
+    return payload
 
 
 @app.get("/api/media")
