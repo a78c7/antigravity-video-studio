@@ -33,6 +33,20 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+
+def _ensure_utf8_stdio() -> None:
+    """在非 UTF-8 终端（如英文 Windows cp1252 / 中文 Windows gbk）下安全切换标准流编码。"""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_ensure_utf8_stdio()
+
 EXCLUDED_DIRS: frozenset[str] = frozenset(
     {
         ".git",
@@ -254,6 +268,8 @@ def _check_git_tracked_files(root: Path) -> list[Finding]:
             ["git", "-C", str(root), "ls-files"],
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=10,
             check=False,
         )

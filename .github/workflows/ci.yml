@@ -7,6 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
 jobs:
   linux-check:
     name: Linux 隐私巡检、编译与单测
@@ -74,11 +78,15 @@ jobs:
           python-version: "3.12"
 
       - name: 零隐私与防泄密巡检
-        run: python scripts/privacy_check.py
+        shell: pwsh
+        run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+          python scripts/privacy_check.py
 
       - name: 校验 start.ps1 PowerShell 语法解析与编码
         shell: pwsh
         run: |
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $scriptPath = (Resolve-Path ".\start.ps1").Path
           $tokens = $null
           $parseErrors = $null
