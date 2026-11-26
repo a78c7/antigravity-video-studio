@@ -788,12 +788,14 @@ def test_tts_multilingual_auto_detect_and_endpoint_passthrough(
     assert cli_media.resolve_tts_language("中文台词强制英文", "en-US") == "en-US"
     assert cli_media.resolve_tts_language("English line", "en") == "en-US"
 
+    monkeypatch.setattr(cli_media, "resolve_gemini_cli_bin", lambda: "gemini-api")
     cmd_en = cli_media.build_tts_cmd(
         "The rain just stopped on the rooftop.",
         studio_env.tmp_path / "en_vo.wav",
         voice="Kore",
         language="auto",
     )
+    assert cmd_en[0] == "gemini-api"
     assert "--language" in cmd_en
     assert cmd_en[cmd_en.index("--language") + 1] == "en-US"
 
