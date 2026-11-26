@@ -1000,21 +1000,58 @@ def build_music_cmd(prompt: str, out_path: Path, *, dry_run: bool = False) -> li
     return cmd
 
 
+_TTS_LANG_ALIASES: dict[str, str] = {
+    "zh": "zh-CN",
+    "zh-cn": "zh-CN",
+    "zh-tw": "zh-TW",
+    "en": "en-US",
+    "en-us": "en-US",
+    "en-gb": "en-GB",
+    "ja": "ja-JP",
+    "ja-jp": "ja-JP",
+    "ko": "ko-KR",
+    "ko-kr": "ko-KR",
+    "es": "es-ES",
+    "fr": "fr-FR",
+    "de": "de-DE",
+}
+
+
+def resolve_tts_language(text: str, language: str = "auto") -> str:
+    """
+    解析 TTS 目标语种（BCP-47）：
+    - 显式传入具体语种（如 en-US / zh-CN / ja-JP / ko-KR）时优先按显式语种执行；
+    - 传入 auto 或留空时，按台词字符自动识别日文 / 韩文 / 中文 / 英文（默认 en-US）。
+    """
+    raw = (language or "").strip()
+    if raw and raw.lower() != "auto":
+        return _TTS_LANG_ALIASES.get(raw.lower(), raw)
+
+    sample = text or ""
+    if re.search(r"[\u3040-\u30ff]", sample):
+        return "ja-JP"
+    if re.search(r"[\uac00-\ud7af]", sample):
+        return "ko-KR"
+    if re.search(r"[\u4e00-\u9fff]", sample):
+        return "zh-CN"
+    return "en-US"
+
+
 def build_tts_cmd(
     text: str,
     out_path: Path,
     voice: str = "Kore",
     style_prompt: str = "",
-    language: str = "zh-CN",
+    language: str = "auto",
     *,
     dry_run: bool = False,
 ) -> list[str]:
-    """构造官方 gemini-api tts 24kHz WAV 语音合成命令"""
+    """构造官方 gemini-api tts 24kHz WAV 多语种语音合成命令"""
     models, _ = _resolve_cli_runtime()
     clean_text = (text or "").strip()
     used_voice = (voice or "Kore").strip() or "Kore"
     clean_style = (style_prompt or "").strip()
-    clean_lang = (language or "zh-CN").strip()
+    clean_lang = resolve_tts_language(clean_text, language)
 
     flags: list[str] = [
         "-m",
@@ -1209,13 +1246,13 @@ def _sdk_generate_tts_file(
     cancel_check: CancelCheck | None = None,
 ) -> Path:
     """
-    使用官方 google-genai SDK 生成中文旁白 TTS（输出标准 24kHz WAV）：
+    使用官方 google-genai SDK 生成多语种旁白 TTS（输出标准 24kHz WAV，支持中/英/日/韩等）：
     - `gemini-3.8-flash-tts` 等优先走 `interactions.create`（带 `speech_config` 与 `speech_metadata` 语气标注），失败且为兼容性错误时平滑回退 `generate_content`；
     - `gemini-2.5-flash-preview-tts` 等标准 AI Studio TTS 模型优先走 `models.generate_content(response_modalities=["AUDIO"], speech_config=...)`；
     - 返回原始 PCM 时自动用 Python 标准库 `wave` 封装为有效 24kHz 单声道 WAV 文件。
     """
     clean_style = (style_prompt or "").strip()
-    clean_lang = (language or "zh-CN").strip()
+    clean_lang = resolve_tts_language(text, language)
     prefer_generate_content = ("preview-tts" in model.lower()) or ("2.5-" in model.lower())
 
     def _run_interactions_tts(client: Any, hc: httpx.Client, api_key: str) -> tuple[bytes, str, dict[str, Any]]:
@@ -1236,7 +1273,13 @@ def _sdk_generate_tts_file(
         return _extract_interaction_media(interaction, "audio", client, hc, api_key)
 
     def _run_generate_content_tts(client: Any) -> tuple[bytes, str, dict[str, Any]]:
-        tts_input = f"请用以下导演语气自然朗读下方台词（只读台词本身）：\n语气：{clean_style}\n台词：{text}" if clean_style else text
+        if clean_style:
+            if clean_lang.lower().startswith("zh"):
+                tts_input = f"请用以下导演语气自然朗读下方台词（只读台词本身）：\n语气：{clean_style}\n台词：{text}"
+            else:
+                tts_input = f"Speak only the following line naturally in the requested director tone:\nTone: {clean_style}\nLine: {text}"
+        else:
+            tts_input = text
         voice_cfg = types.VoiceConfig(prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice))
         speech_kwargs: dict[str, Any] = {"voice_config": voice_cfg}
         if clean_lang and "language_code" in getattr(types.SpeechConfig, "model_fields", {}):
@@ -1677,12 +1720,12 @@ def cli_generate_tts(
     voice: str = "Kore",
     style_prompt: str = "",
     stem: str = "vo",
-    language: str = "zh-CN",
+    language: str = "auto",
     *,
     progress_cb: ProgressCallback | None = None,
     cancel_check: CancelCheck | None = None,
 ) -> dict[str, Any]:
-    """生成 24kHz 标准 WAV 旁白，探测真实时长并记入 api_usage_logs（SDK 直连主通道 + CLI 完整保留）"""
+    """生成 24kHz 标准 WAV 多语种旁白，探测真实时长并记入 api_usage_logs（SDK 直连主通道 + CLI 完整保留）"""
     clean_text = (text or "").strip()
     if not clean_text:
         raise ValueError("旁白配音文本不能为空。")
@@ -1695,6 +1738,7 @@ def cli_generate_tts(
     tts_cost = float(pricing.get("tts", DEFAULT_CLI_PRICING["tts"]))
 
     used_voice = (voice or "Kore").strip() or "Kore"
+    resolved_lang = resolve_tts_language(clean_text, language)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     ts_tag = time.strftime("%Y%m%d_%H%M%S")
@@ -1704,13 +1748,13 @@ def cli_generate_tts(
         expected = out_dir / f"{safe_stem}_{ts_tag}_{int(time.time() * 1000) % 1000:03d}.wav"
 
     def _run_via_cli() -> Path:
-        _report_progress(progress_cb, 25, f"CLI 正在合成中文旁白（{tts_model} · {used_voice}）...")
+        _report_progress(progress_cb, 25, f"CLI 正在合成旁白（{tts_model} · {used_voice} · {resolved_lang}）...")
         cmd = build_tts_cmd(
             clean_text,
             expected,
             voice=used_voice,
             style_prompt=style_prompt,
-            language=language,
+            language=resolved_lang,
         )
         started = time.time()
         proc = _run_cli_with_retry(cmd, env=_build_cli_env(), timeout=120, expected_path=expected, cancel_check=cancel_check)
@@ -1735,7 +1779,7 @@ def cli_generate_tts(
                 tts_model,
                 used_voice,
                 style_prompt,
-                language,
+                resolved_lang,
                 expected,
                 cfg,
                 progress_cb=progress_cb,
@@ -1755,7 +1799,7 @@ def cli_generate_tts(
     meta = probe_media(actual)
     duration_sec = round(float(meta.get("duration_sec") or 0.0), 2)
     record_cli_cost(tts_model, "cli_tts" if engine_used == "cli" else "sdk_tts", tts_cost)
-    _report_progress(progress_cb, 100, f"旁白 WAV 已生成（{duration_sec:.1f}s）")
+    _report_progress(progress_cb, 100, f"旁白 WAV 已生成（{duration_sec:.1f}s · {resolved_lang}）")
     return {
         "file_path": str(actual.resolve()),
         "filename": actual.name,
@@ -1763,6 +1807,7 @@ def cli_generate_tts(
         "est_cost_usd": round(tts_cost, 4),
         "model": tts_model,
         "voice": used_voice,
+        "language": resolved_lang,
         "engine": engine_used,
     }
 

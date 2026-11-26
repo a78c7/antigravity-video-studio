@@ -75,7 +75,7 @@ flowchart LR
 
 ## What's New in v1.0.1
 
-- **Official `google-genai` Python SDK Direct Engine**: No external CLI setup required — paste your `GEMINI_API_KEY` in Settings to generate images, videos, original music, and TTS voiceovers out of the box. The `gemini-api` CLI remains supported as an optional/fallback channel (`MEDIA_ENGINE_MODE`: `auto` / `sdk` / `cli`).
+- **Official `google-genai` Python SDK Direct Engine**: No external CLI setup required — paste your `GEMINI_API_KEY` in Settings to generate images, videos, original music, and **multilingual TTS voiceovers (English, Chinese, Japanese, Korean, and more with auto-detection & explicit language selector)** out of the box. The `gemini-api` CLI remains supported as an optional/fallback channel (`MEDIA_ENGINE_MODE`: `auto` / `sdk` / `cli`).
 - **Precision Voiceover-to-Shot Sync**: Automatically handles voiceovers longer than their video clip via `pad` (smooth last-frame freeze extension with downstream timeline ripple so trailing speech is never clipped or overlapped) or `speed` (up to `1.20x` subtle tempo speedup + freeze-frame fallback), keeping `.srt` subtitles tightly synced.
 - **Lightweight SQLite Async Job Queue**: Image/video generation, BGM, batch TTS, dual-aspect covers, local 1080p renders, and Colab 4K jobs run asynchronously with real-time progress bars, page-refresh persistence, cancellation, and concurrent multi-shot work.
 - **Four Flagship WebUI Capabilities Visualized**: One-click web controls for **Numbered Keyframe Contact Sheet**, **3-Frame + Audio Hallucination QC**, **One-Click Batch TTS Voiceover**, and **Per-Shot Custom Voice Upload / Subtitle-Only Toggle**.

@@ -772,3 +772,72 @@ def test_cloud_collab_mode_404_and_401_isolation(studio_env, monkeypatch: pytest
     # 4. 同步接口未携带有效 X-Sync-Token 必须返回 401
     r_sync = client.get("/api/sync/pull")
     assert r_sync.status_code == 401
+
+
+def test_tts_multilingual_auto_detect_and_endpoint_passthrough(
+    studio_env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """验证多语种 TTS 语种自动识别（英/中/日/韩）、显式覆盖与批量 TTS 接口透传"""
+    import backend.cli_media as cli_media
+    import backend.routers.delivery as delivery_mod
+
+    assert cli_media.resolve_tts_language("Hello world, welcome to the rooftop.", "auto") == "en-US"
+    assert cli_media.resolve_tts_language("雨刚停，天台积水里亮起了一枚旧星盘。", "auto") == "zh-CN"
+    assert cli_media.resolve_tts_language("星図が光り始めた。", "auto") == "ja-JP"
+    assert cli_media.resolve_tts_language("별빛이 켜졌다.", "auto") == "ko-KR"
+    assert cli_media.resolve_tts_language("中文台词强制英文", "en-US") == "en-US"
+    assert cli_media.resolve_tts_language("English line", "en") == "en-US"
+
+    cmd_en = cli_media.build_tts_cmd(
+        "The rain just stopped on the rooftop.",
+        studio_env.tmp_path / "en_vo.wav",
+        voice="Kore",
+        language="auto",
+    )
+    assert "--language" in cmd_en
+    assert cmd_en[cmd_en.index("--language") + 1] == "en-US"
+
+    client = studio_env.client
+    projs = client.get("/api/projects").json()["projects"]
+    ep_id = client.get(f"/api/projects/{projs[0]['id']}/episodes").json()["episodes"][0]["id"]
+    shots = client.get(f"/api/episodes/{ep_id}/shots").json()["shots"]
+    first_shot_id = shots[0]["id"]
+
+    captured: list[dict[str, Any]] = []
+
+    def _fake_cli_generate_tts(*args: Any, **kwargs: Any) -> dict[str, Any]:
+        captured.append(dict(kwargs))
+        out_dir = Path(kwargs["out_dir"])
+        out_dir.mkdir(parents=True, exist_ok=True)
+        wav = _write_test_wav(out_dir / f"{kwargs.get('stem', 'vo')}.wav", duration_sec=1.5)
+        resolved = cli_media.resolve_tts_language(kwargs.get("text", ""), kwargs.get("language", "auto"))
+        return {
+            "file_path": str(wav.resolve()),
+            "filename": wav.name,
+            "duration_sec": 1.5,
+            "est_cost_usd": 0.01,
+            "model": "gemini-3.8-flash-tts",
+            "voice": kwargs.get("voice", "Kore"),
+            "language": resolved,
+            "engine": "sdk",
+        }
+
+    monkeypatch.setattr(delivery_mod, "cli_generate_tts", _fake_cli_generate_tts)
+
+    resp = client.post(
+        f"/api/episodes/{ep_id}/cli-generate-tts",
+        json={
+            "voice": "Aoede",
+            "language": "en-US",
+            "style_prompt": "Warm cinematic narrator",
+            "shot_ids": [first_shot_id],
+            "async_mode": False,
+        },
+    )
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["language"] == "en-US"
+    assert data["generated_count"] == 1
+    assert len(captured) == 1
+    assert captured[0]["language"] == "en-US"
+    assert data["shots"][0]["language"] == "en-US"

@@ -462,6 +462,17 @@ const TTS_VOICE_OPTIONS = [
   { id: 'Zephyr', label: 'Zephyr（清亮明快 · 都市轻喜剧）' },
 ];
 
+const TTS_LANGUAGE_OPTIONS = [
+  { id: 'auto', label: '自动识别 Auto（按每镜台词自动切中/英/日/韩）' },
+  { id: 'en-US', label: 'English (en-US · 英文旁白)' },
+  { id: 'zh-CN', label: '中文普通话 (zh-CN)' },
+  { id: 'ja-JP', label: '日本語 (ja-JP)' },
+  { id: 'ko-KR', label: '한국어 (ko-KR)' },
+];
+
+const DEFAULT_STYLE_ZH = '自然温暖、语速适中、有画面感的短视频旁白';
+const DEFAULT_STYLE_EN = 'Warm, natural, cinematic short-drama narrator at a crisp pace';
+
 export const BatchTtsAndVoPanel: React.FC<BatchTtsAndVoPanelProps> = ({
   episodeId,
   episode,
@@ -475,13 +486,24 @@ export const BatchTtsAndVoPanel: React.FC<BatchTtsAndVoPanelProps> = ({
 }) => {
   const [modalOpen, setModalOpen] = useState(false);
   const [voice, setVoice] = useState('Kore');
-  const [stylePrompt, setStylePrompt] = useState('自然温暖、语速适中、有画面感的中文短视频旁白');
+  const [language, setLanguage] = useState('auto');
+  const [stylePrompt, setStylePrompt] = useState(DEFAULT_STYLE_ZH);
   const [submittingTts, setSubmittingTts] = useState(false);
   const [shotBusyMap, setShotBusyMap] = useState<Record<number, boolean>>({});
   const [audioNonce, setAudioNonce] = useState<Record<number, number>>({});
 
   const shotsWithText = shots.filter((s) => Boolean((s.cn_dialogue || s.subtitle_text || '').trim()));
   const voReadyCount = shots.filter((s) => Boolean((s.vo_file_path || '').trim())).length;
+
+  const handleLanguageChange = (nextLang: string) => {
+    setLanguage(nextLang);
+    const trimmed = stylePrompt.trim();
+    if (nextLang.startsWith('en') && (!trimmed || trimmed === DEFAULT_STYLE_ZH)) {
+      setStylePrompt(DEFAULT_STYLE_EN);
+    } else if (nextLang.startsWith('zh') && (!trimmed || trimmed === DEFAULT_STYLE_EN)) {
+      setStylePrompt(DEFAULT_STYLE_ZH);
+    }
+  };
 
   const handleBatchTts = async () => {
     if (!episodeId) return;
@@ -496,22 +518,23 @@ export const BatchTtsAndVoPanel: React.FC<BatchTtsAndVoPanelProps> = ({
         total_cost_usd?: number;
       }>(`/api/episodes/${episodeId}/cli-generate-tts`, {
         voice,
+        language,
         style_prompt: stylePrompt.trim(),
         async_mode: true,
       });
 
       setModalOpen(false);
       if (res.async || res.job_id) {
-        notify(`已提交后台批量 TTS 配音任务（音色 ${voice}），可在顶部任务队列实时查看进度！`);
+        notify(`已提交后台批量 TTS 配音任务（音色 ${voice} · 语种 ${language}），可在顶部任务队列实时查看进度！`);
         onJobSubmitted?.(res.job);
       } else {
         await onUpdated();
         notify(
-          `批量生成中文 TTS 旁白完成（${res.generated_count || 0} 镜 · 约 $${(res.total_cost_usd || 0).toFixed(2)}）`
+          `批量生成 AI TTS 旁白完成（${res.generated_count || 0} 镜 · 约 $${(res.total_cost_usd || 0).toFixed(2)}）`
         );
       }
     } catch (err: any) {
-      notify(err?.message || '批量生成中文 TTS 旁白失败', 'err');
+      notify(err?.message || '批量生成 AI TTS 旁白失败', 'err');
     } finally {
       setSubmittingTts(false);
     }
@@ -581,7 +604,7 @@ export const BatchTtsAndVoPanel: React.FC<BatchTtsAndVoPanelProps> = ({
           )}
           {activeTtsRunning
             ? '后台批量 TTS 配音中...'
-            : `一键批量生成中文 TTS 旁白 (${shotsWithText.length}镜 · ~$${(shotsWithText.length * ttsPricePerShot).toFixed(2)})`}
+            : `一键批量生成多语种 TTS 旁白 (${shotsWithText.length}镜 · ~$${(shotsWithText.length * ttsPricePerShot).toFixed(2)})`}
         </button>
       </div>
 
@@ -670,7 +693,7 @@ export const BatchTtsAndVoPanel: React.FC<BatchTtsAndVoPanelProps> = ({
         )}
       </div>
 
-      {/* 批量中文 TTS 配置弹窗 */}
+      {/* 批量多语种 TTS 配置弹窗 */}
       {modalOpen && (
         <div
           onClick={() => !submittingTts && setModalOpen(false)}
@@ -683,7 +706,7 @@ export const BatchTtsAndVoPanel: React.FC<BatchTtsAndVoPanelProps> = ({
             <div className="flex items-center justify-between gap-2">
               <div className="flex items-center gap-2 text-sm font-semibold text-slate-900">
                 <Mic className="h-4 w-4 text-emerald-600" />
-                一键批量生成中文 TTS 旁白
+                一键批量生成多语种 TTS 旁白（中 / 英 / 日 / 韩）
               </div>
               <button
                 type="button"
@@ -703,6 +726,21 @@ export const BatchTtsAndVoPanel: React.FC<BatchTtsAndVoPanelProps> = ({
 
             <div className="space-y-3 text-xs">
               <div>
+                <label className="mb-1 block font-medium text-slate-700">配音语种（Language）</label>
+                <select
+                  value={language}
+                  onChange={(e) => handleLanguageChange(e.target.value)}
+                  className="studio-input w-full rounded-lg px-3 py-2 text-xs"
+                >
+                  {TTS_LANGUAGE_OPTIONS.map((item) => (
+                    <option key={item.id} value={item.id}>
+                      {item.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              <div>
                 <label className="mb-1 block font-medium text-slate-700">选择配音音色（Voice）</label>
                 <select
                   value={voice}
@@ -719,13 +757,13 @@ export const BatchTtsAndVoPanel: React.FC<BatchTtsAndVoPanelProps> = ({
 
               <div>
                 <label className="mb-1 block font-medium text-slate-700">
-                  导演语气与情绪提示（可选，支持中文）
+                  导演语气与情绪提示（可选，支持中文或 English）
                 </label>
                 <textarea
                   value={stylePrompt}
                   onChange={(e) => setStylePrompt(e.target.value)}
                   rows={3}
-                  placeholder="例：温暖治愈、略带悬念感、语速稍快、停顿干脆"
+                  placeholder="例：温暖治愈、略带悬念感 / Warm, cinematic narrator at a crisp pace"
                   className="studio-input w-full rounded-lg p-2.5 text-xs leading-relaxed"
                 />
               </div>

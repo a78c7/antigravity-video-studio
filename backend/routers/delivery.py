@@ -148,6 +148,7 @@ class RenderLocalRequest(BaseModel):
 
 class CliGenerateTtsRequest(BaseModel):
     voice: str = "Kore"
+    language: str = "auto"  # auto（按台词自动识别中/英/日/韩）或显式 BCP-47 如 en-US / zh-CN / ja-JP / ko-KR
     style_prompt: str = ""
     shot_ids: list[int] | None = None
     async_mode: bool = False
@@ -881,13 +882,14 @@ def cli_generate_episode_tts(
         raise HTTPException(status_code=400, detail="本集所选分镜均无台词或字幕文本，无需生成 TTS 旁白。")
 
     voice = (req.voice or "Kore").strip() or "Kore"
+    language = (req.language or "auto").strip() or "auto"
     style_prompt = (req.style_prompt or "").strip()
 
     def _run_tts(ctx: JobContext | None = None) -> dict[str, Any]:
         total = len(targets)
         if ctx is not None:
             ctx.check_cancelled()
-            ctx.update(progress_pct=5, stage_msg=f"正在并发生成 {total} 镜中文旁白 TTS（音色：{voice}）...")
+            ctx.update(progress_pct=5, stage_msg=f"正在并发生成 {total} 镜旁白 TTS（音色：{voice} · 语种：{language}）...")
 
         generated_indexed: list[tuple[int, dict[str, Any]]] = []
         errors: list[dict[str, Any]] = []
@@ -909,6 +911,7 @@ def cli_generate_episode_tts(
                 voice=voice,
                 style_prompt=style_prompt,
                 stem=stem,
+                language=language,
                 **_filter_supported_kwargs(cli_generate_tts, extra_cb),
             )
             return order_idx, shot_item, tts_text, res
@@ -947,6 +950,7 @@ def cli_generate_episode_tts(
                                 "est_cost_usd": cost,
                                 "model": res.get("model") or "",
                                 "voice": res.get("voice") or voice,
+                                "language": res.get("language") or language,
                             },
                         )
                     )
@@ -989,6 +993,7 @@ def cli_generate_episode_tts(
             "episode_id": episode_id,
             "vo_mode": "tts",
             "voice": voice,
+            "language": language,
             "generated_count": len(generated),
             "failed_count": len(errors),
             "skipped_shots": skipped_shots,
@@ -1005,7 +1010,7 @@ def cli_generate_episode_tts(
             _run_tts,
             episode_id=episode_id,
             target_host="local",
-            stage_msg=f"已排队：等待并发生成 {len(targets)} 镜中文旁白 TTS",
+            stage_msg=f"已排队：等待并发生成 {len(targets)} 镜旁白 TTS（{language}）",
         )
         return {"ok": True, "async": True, "job_id": job["id"], "job": job}
 
